@@ -1,0 +1,23 @@
+{
+  "name": "brieflane",
+  "version": "0.1.0",
+  "description": "Brieflane — the brand-deal inbox and daily briefing for independent creators.",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning src/server.js",
+    "dev": "node --env-file-if-exists=.env --disable-warning=ExperimentalWarning --watch src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "gen-key": "node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\""
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.14"
+  }
+}

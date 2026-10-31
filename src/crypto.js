@@ -9,8 +9,12 @@ const crypto = require('node:crypto');
  * key rotation / KMS envelope encryption later without a data migration.
  */
 function makeCipher(keyB64) {
-  const key = Buffer.from(keyB64, 'base64');
-  if (key.length !== 32) throw new Error('Token key must be 32 bytes (base64).');
+  // Accept a 32-byte base64 key, or any long random passphrase (e.g. from a password manager) hashed to 32 bytes.
+  let key = /^[A-Za-z0-9+/]{43}=$/.test(String(keyB64)) ? Buffer.from(keyB64, 'base64') : null;
+  if (!key || key.length !== 32) {
+    if (String(keyB64).length < 32) throw new Error('TOKEN_ENC_KEY must be at least 32 random characters.');
+    key = crypto.createHash('sha256').update(String(keyB64)).digest();
+  }
   return {
     encrypt(plain, aad) {
       if (plain == null) return null;

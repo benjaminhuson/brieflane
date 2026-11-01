@@ -86,7 +86,7 @@ async function viewLogin() {
       ${c.devLogin ? `<button class="btn ${c.googleConfigured ? '' : 'btn-primary'}" style="width:100%" data-act="dev-login">Open the Huson DIY demo workspace</button>` : ''}
       ${!c.googleConfigured && !c.devLogin ? '<p class="banner info">Sign-in isn\'t configured on this server yet.</p>' : ''}
     </div>
-    <p class="small muted" style="margin-top:18px">Brieflane reads only collaboration-related email, never sends anything without your explicit approval, and lets you export or delete everything.</p>
+    <p class="small muted" style="margin-top:18px">Brieflane reads only collaboration-related email, never sends anything without your explicit approval, and lets you export or delete everything. <a class="link" href="/privacy.html">Privacy policy</a></p>
   </div></div>`;
 }
 

@@ -6,6 +6,9 @@
   node_bundler = "esbuild"
   # Local-dev database engine; never needed in production.
   external_node_modules = ["@electric-sql/pglite"]
+  # Netlify's file tracer misses the Postgres driver (required inside src/db.js), so ship it explicitly
+  # and leave out the 17MB local-only PGlite engine.
+  included_files = ["node_modules/postgres/**", "!node_modules/@electric-sql/**"]
 
 # Security headers for the static app shell (API responses set their own).
 [[headers]]

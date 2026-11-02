@@ -7,6 +7,7 @@ const { ask } = require('./ai/assistant');
 const { generateDraft } = require('./ai/drafts');
 const { setStageByUser, refreshDerived } = require('./ingest/pipeline');
 const { safeEqual } = require('./crypto');
+const { AGENTS, ORDER, isEnabled } = require('./agents');
 
 const SECURITY_HEADERS = {
   'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self' https://accounts.google.com; object-src 'none'",
@@ -85,16 +86,67 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
 
   route('GET', '/api/today', {}, async (ctx) => {
     const now = clock();
-    const snap = await ctx.repo.snapshot();
+    const [snap, activity, cached] = await Promise.all([ctx.repo.snapshot(), ctx.repo.recentAgentActivity(new Date(now - 3 * 864e5).toISOString()), ctx.repo.cachedBriefing()]);
     const attention = computeAttention(snap, now);
+    // Rules briefing is instant; the AI version (if enabled) loads separately from /api/briefing.
+    const rules = await briefing(snap, { enabled: false }, { now, name: (ctx.session.name || 'there').split(' ')[0], items: attention });
     return {
-      briefing: await briefing(snap, llm, { now, name: (ctx.session.name || 'there').split(' ')[0], items: attention }),
+      briefing: rules,
+      aiBriefing: llm.enabled,
+      cachedAiBriefing: cached && now - new Date(cached.created_at) < 6 * 3600e3 ? JSON.parse(cached.body) : null,
+      agentActivity: activity.map((r) => ({ ...r, outputs: r.outputs ? JSON.parse(r.outputs) : [], name: AGENTS[r.agent].name })),
       attention,
       pipeline: pipelineCounts(snap),
       upcoming: upcoming(snap, now, 35).filter((u) => new Date(u.date) >= new Date(now - 864e5)),
       hasDemoData: snap.collabs.some((c) => c.is_demo),
       reviewCount: snap.reviewCount,
     };
+  });
+
+  route('GET', '/api/briefing', {}, async (ctx) => { limit(`ai:${ctx.session.tenant_id}`, 60); return svc.aiBriefing(ctx.repo, (ctx.session.name || 'there').split(' ')[0]); });
+
+  // ---------- Agents ----------
+  route('GET', '/api/agents', {}, async (ctx) => {
+    const [settings, runs, all] = await Promise.all([ctx.repo.agentSettings(), ctx.repo.agentRuns(40), ctx.repo.agentRunCounts()]);
+    const counts = Object.fromEntries(all.map((r) => [r.agent, r.n]));
+    return {
+      ai: llm.enabled, aiLabel: llm.label,
+      agents: ORDER.map((stage) => ({ stage, name: AGENTS[stage].name, does: AGENTS[stage].does, enabled: isEnabled(settings, stage), runs: counts[stage] || 0 })),
+      settings: { profile: settings.profile, rates: settings.rates, signoff: settings.signoff },
+      runs: runs.map((r) => ({ ...r, outputs: r.outputs ? JSON.parse(r.outputs) : [], name: AGENTS[r.agent].name })),
+    };
+  });
+  route('POST', '/api/agents/settings', {}, async (ctx) => {
+    const b = ctx.body || {};
+    const enabled = {};
+    if (b.enabled && typeof b.enabled === 'object') for (const k of ORDER) if (typeof b.enabled[k] === 'boolean') enabled[k] = b.enabled[k];
+    let rates;
+    if (b.rates && typeof b.rates === 'object') {
+      rates = {};
+      for (const k of ['dedicated', 'integration', 'short', 'review']) { const v = Number(b.rates[k]); if (Number.isFinite(v) && v >= 0 && v < 1e6) rates[k] = Math.round(v); }
+    }
+    const saved = await ctx.repo.saveAgentSettings({ enabled, rates,
+      profile: typeof b.profile === 'string' ? b.profile.slice(0, 1500) : undefined, signoff: typeof b.signoff === 'string' ? b.signoff.slice(0, 60) : undefined });
+    await ctx.repo.audit(ctx.session.user_id, 'agents.settings');
+    return saved;
+  });
+  route('POST', '/api/agents/run', {}, async (ctx) => { limit(`agents:${ctx.session.tenant_id}`, 60); return svc.runAgentsStep(ctx.repo); });
+  route('POST', '/api/collaborations/:id/agent', {}, async (ctx) => {
+    limit(`agents:${ctx.session.tenant_id}`, 60);
+    const c = await ctx.repo.collab(ctx.params.id);
+    if (!c) throw httpErr(404, 'not found');
+    await ctx.repo.enqueueAgent({ collabId: c.id, agent: c.stage, stage: c.stage, runKey: `manual:${Date.now()}`, trigger: 'manual' });
+    await ctx.repo.audit(ctx.session.user_id, 'agent.manual', { cid: c.id, agent: c.stage });
+    return svc.runAgentsStep(ctx.repo);
+  });
+  route('PUT', '/api/docs/:id', {}, async (ctx) => {
+    if (!(await ctx.repo.doc(ctx.params.id))) throw httpErr(404, 'not found');
+    await ctx.repo.updateDoc(ctx.params.id, { body: typeof (ctx.body || {}).body === 'string' ? ctx.body.body.slice(0, 20000) : null });
+    return ctx.repo.doc(ctx.params.id);
+  });
+  route('POST', '/api/docs/:id/dismiss', {}, async (ctx) => {
+    if (!(await ctx.repo.doc(ctx.params.id))) throw httpErr(404, 'not found');
+    await ctx.repo.updateDoc(ctx.params.id, { dismissed: 1 }); return { ok: true };
   });
 
   route('GET', '/api/planner', {}, async (ctx) => ({ ...planner(await ctx.repo.snapshot(), clock()), today: clock().toISOString() }));
@@ -115,16 +167,21 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
   });
 
   route('GET', '/api/collaborations/:id', {}, async (ctx) => {
-    const [c, facts, messages, drafts, tasks] = await Promise.all([
+    const [c, facts, messages, drafts, tasks, docs, runs, settings] = await Promise.all([
       ctx.repo.collab(ctx.params.id),
       ctx.repo.facts(ctx.params.id, { statuses: ['active', 'pending_review', 'superseded'] }),
       ctx.repo.messagesForCollab(ctx.params.id),
       ctx.repo.drafts(ctx.params.id),
       ctx.repo.tasks({ includeDone: true }),
+      ctx.repo.docs(ctx.params.id),
+      ctx.repo.agentRunsFor(ctx.params.id),
+      ctx.repo.agentSettings(),
     ]);
     if (!c) throw httpErr(404, 'not found');
     return {
-      collab: c, facts, drafts,
+      collab: c, facts, drafts, docs,
+      agent: { stage: c.stage, name: AGENTS[c.stage].name, does: AGENTS[c.stage].does, enabled: isEnabled(settings, c.stage) },
+      agentRuns: runs.map((r) => ({ ...r, outputs: r.outputs ? JSON.parse(r.outputs) : [], name: AGENTS[r.agent].name })),
       messages: messages.map((m) => ({ ...m, message_id_header: undefined })),
       tasks: tasks.filter((t) => t.collab_id === c.id),
     };
@@ -133,13 +190,14 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
     const c = await ctx.repo.collab(ctx.params.id);
     if (!c) throw httpErr(404, 'not found');
     const b = ctx.body || {};
-    if (b.stage) await setStageByUser(ctx.repo, c.id, b.stage, ctx.session.user_id);
+    let agentQueued = false;
+    if (b.stage) agentQueued = await setStageByUser(ctx.repo, c.id, b.stage, ctx.session.user_id);
     if (b.resetStage) { await ctx.repo.updateCollab(c.id, { stage_basis: 'inferred', stage_reason: null }); await refreshDerived(ctx.repo, c.id, { now: clock() }); }
     const patch = {};
     for (const k of ['brand', 'product', 'agency']) if (typeof b[k] === 'string') patch[k] = b[k].slice(0, 120);
     if (typeof b.archived === 'boolean') patch.archived = b.archived ? 1 : 0;
     if (Object.keys(patch).length) { await ctx.repo.updateCollab(c.id, patch); await ctx.repo.audit(ctx.session.user_id, 'collab.edit', { cid: c.id, fields: Object.keys(patch) }); }
-    return ctx.repo.collab(c.id);
+    return { ...(await ctx.repo.collab(c.id)), agentQueued: Boolean(agentQueued) };
   });
   route('POST', '/api/collaborations/:id/facts', {}, async (ctx) => {
     const c = await ctx.repo.collab(ctx.params.id);

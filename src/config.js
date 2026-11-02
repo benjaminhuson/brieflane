@@ -47,8 +47,8 @@ function loadConfig(overrides = {}) {
     sessionTtlDays: Number(env.SESSION_TTL_DAYS) || 30,
     defaultRetentionDays: Number(env.DEFAULT_RETENTION_DAYS) || 400,
     historicalImportDays: 365,
-    // Netlify synchronous functions time out at 10s by default; each sync/import step stops before that.
-    stepBudgetMs: Number(env.STEP_BUDGET_MS) || (isServerless ? 6500 : 60000),
+    // Netlify synchronous functions stop at 60s (scheduled: 30s); each sync/import step stops well before that.
+    stepBudgetMs: Number(env.STEP_BUDGET_MS) || (isServerless ? 25000 : 60000),
   };
 }
 

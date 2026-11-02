@@ -53,6 +53,8 @@ const P = {
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v5h1"/>',
   plan: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 13h6M8 16.5h9"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  bot: '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9.5 16.5h5"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>',
   flask: '<path d="M9 3h6M10 3v6L4.5 18.5A2 2 0 0 0 6.2 21h11.6a2 2 0 0 0 1.7-2.5L14 9V3"/>',
 };
 const icon = (n) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[n]}</svg>`;
@@ -66,7 +68,7 @@ const badge = (basis, text) => { const [cls, ic, label] = BASIS[basis] || BASIS.
 const demoBadge = '<span class="badge b-demo">Demo data</span>';
 
 // ---------- layout ----------
-const NAV = [['today', 'Today', 'today'], ['planner', 'Planner', 'plan'], ['deals', 'Deals', 'deals'], ['calendar', 'Calendar', 'cal'], ['review', 'Review', 'review'], ['assistant', 'Ask', 'ask'], ['settings', 'Settings', 'settings']];
+const NAV = [['today', 'Today', 'today'], ['planner', 'Planner', 'plan'], ['deals', 'Deals', 'deals'], ['calendar', 'Calendar', 'cal'], ['review', 'Review', 'review'], ['agents', 'Agents', 'bot'], ['assistant', 'Ask', 'ask'], ['settings', 'Settings', 'settings']];
 const TABS = ['today', 'planner', 'deals', 'review', 'assistant', 'settings'];
 function navLinks(route) {
   const rc = state.reviewCount || 0;
@@ -138,11 +140,11 @@ async function viewToday() {
       ${g ? `<button class="btn" data-act="sync">${icon('sync')}Check email</button>` : '<a class="btn btn-accent" href="#/settings">Connect Gmail</a>'}</div>
     <div class="today-grid">
       <div class="stack">
-        <section class="card brief"><h2>${esc(d.briefing.headline)}</h2>${d.briefing.lines.map((l) => `<p>${esc(l)}</p>`).join('')}
-          <div class="meta">${icon('spark')}Daily briefing · ${esc(d.briefing.generator === 'rules' ? 'built by rules (no AI key)' : d.briefing.generator)}</div></section>
+        <section class="card brief" id="brief">${briefInner(d.cachedAiBriefing || d.briefing, d.aiBriefing && !d.cachedAiBriefing)}</section>
         <section class="card"><div class="card-head"><h2>Urgent actions</h2><span class="spacer"></span><span class="small muted">${d.attention.length} item${d.attention.length === 1 ? '' : 's'}</span></div>${attention}</section>
       </div>
       <div class="stack">
+        ${agentActivityCard(d.agentActivity || [])}
         <section class="card"><div class="card-head"><h2>Coming up</h2><span class="spacer"></span><a class="link" href="#/calendar">Calendar</a></div>${agenda}</section>
         <section class="card"><div class="card-head"><h2>Pipeline</h2><span class="spacer"></span><a class="link" href="#/deals">All deals</a></div><div class="pipeline">${pipe}</div></section>
       </div>
@@ -211,7 +213,7 @@ async function viewDeal(id) {
     const steps = `<div class="steps"><span class="${x.status === 'draft' ? 'on' : ''}">Draft</span><span class="${x.status === 'approved' ? 'on' : ''}">Approved</span><span class="${x.status === 'sent' ? 'on' : ''}">Sent</span></div>`;
     if (x.status === 'sent') return `<div class="draft"><div class="draft-status">${steps}<span class="spacer"></span><span class="mono muted">${fmtWhen(x.sent_at)}</span></div><pre style="white-space:pre-wrap;margin:0;font:14px/1.55 var(--sans);color:var(--ink-2)">${esc(x.body)}</pre></div>`;
     return `<div class="draft" data-draft="${x.id}">
-      <div class="draft-status">${steps}<span class="spacer"></span><span class="badge b-inferred">${icon('spark')}${esc(x.generator === 'template' ? 'Template draft' : 'AI draft')}</span></div>
+      <div class="draft-status">${steps}<span class="spacer"></span><span class="badge b-inferred">${icon(/·/.test(x.generator || '') ? 'bot' : 'spark')}${esc(/·/.test(x.generator || '') ? `${x.generator} draft` : x.generator === 'template' ? 'Template draft' : 'AI draft')}</span></div>
       <label class="field">To<input type="text" name="to_addr" value="${esc(x.to_addr)}" ${x.status === 'approved' ? 'readonly' : ''}></label>
       <label class="field" style="margin-top:8px">Subject<input type="text" name="subject" value="${esc(x.subject)}" ${x.status === 'approved' ? 'readonly' : ''}></label>
       <label class="field" style="margin-top:8px">Message<textarea name="body" ${x.status === 'approved' ? 'readonly' : ''}>${esc(x.body)}</textarea></label>
@@ -242,11 +244,12 @@ async function viewDeal(id) {
             </form></details>
         </div></section>
         <section class="card"><div class="card-head"><h2>Tasks</h2></div><div class="card-pad stack">
-          ${d.tasks.map((t) => `<label class="row" style="flex-wrap:nowrap"><input type="checkbox" data-act="task-toggle" data-id="${t.id}" ${t.done ? 'checked' : ''}><span style="${t.done ? 'text-decoration:line-through;color:var(--ink-3)' : ''}">${esc(t.title)}</span><span class="spacer"></span><span class="mono muted">${t.due_at ? fmtDate(t.due_at) : ''}</span></label>`).join('') || '<div class="small muted">No tasks yet.</div>'}
+          ${d.tasks.map((t) => `<label class="row" style="flex-wrap:nowrap"><input type="checkbox" data-act="task-toggle" data-id="${t.id}" ${t.done ? 'checked' : ''}><span style="${t.done ? 'text-decoration:line-through;color:var(--ink-3)' : ''}">${esc(t.title)}</span>${(t.source || '').startsWith('agent:') ? `<span class="badge b-inferred" title="Added by an agent">${icon('bot')}Agent</span>` : ''}<span class="spacer"></span><span class="mono muted">${t.due_at ? fmtDate(t.due_at) : ''}</span></label>`).join('') || '<div class="small muted">No tasks yet.</div>'}
           <form data-form="add-task" class="row" style="flex-wrap:nowrap"><input type="text" name="title" placeholder="Add a task…" required><input type="date" name="dueAt" style="max-width:160px"><button class="btn btn-sm" type="submit">Add</button></form>
         </div></section>
       </div>
       <div class="stack">
+        ${agentPanel(d)}
         <section class="card"><div class="card-head"><h2>Reply</h2><span class="spacer"></span>${!drafts.some((x) => x.status !== 'sent') && d.messages.some((m) => m.direction === 'in') ? `<button class="btn btn-primary btn-sm" data-act="draft-new">${icon('spark')}Suggest a reply</button>` : ''}</div>
           ${draftHtml || '<div class="empty">Brieflane drafts replies for you to edit. Nothing is ever sent without your approval.</div>'}</section>
         <section class="card"><div class="card-head"><h2>Email history</h2><span class="spacer"></span><span class="small muted">${d.messages.length} message${d.messages.length === 1 ? '' : 's'}</span></div>${thread}</section>
@@ -325,6 +328,7 @@ async function viewSettings(params) {
         <div class="row" style="margin-top:14px"><button class="btn" data-act="sync">${icon('sync')}Check email now</button><button class="btn" data-act="import-history">Import last 12 months</button><span class="spacer"></span><button class="btn btn-danger btn-sm" data-act="disconnect">Disconnect</button></div>
         <p class="small muted">The 12-month import sends anything older than 30 days to <a href="#/review">Review</a> first, so old or ambiguous deals never look current.</p>` : ''}
       </div></section>
+    <a class="card card-pad row" href="#/agents" style="text-decoration:none;flex-wrap:nowrap">${icon('bot')}<div style="flex:1"><b>Agents</b><div class="small muted">Switch stage agents on or off, set your channel profile and rate card, see what they've done.</div></div><span class="chev">${icon('chev')}</span></a>
     <section class="card"><div class="card-head">${icon('spark')}<h2>AI</h2><span class="spacer"></span><span class="badge ${/^AI/.test(me.ai) ? 'b-inferred' : 'b-plain'}">${esc(me.ai)}</span></div>
       <div class="card-pad small">Without an AI key, Brieflane uses transparent rules for extraction, briefings, drafts and answers. With one, it uses the AI but still verifies every quoted fact against the original email and never treats a deal as agreed without explicit wording.</div></section>
     <section class="card"><div class="card-head">${icon('shield')}<h2>Privacy & data</h2></div><div class="card-pad stack">
@@ -337,6 +341,109 @@ async function viewSettings(params) {
     </div></section>
     <section class="card"><div class="card-head"><h2>Activity log</h2></div><div class="card-pad audit">${audit.map((a) => `${esc(a.at.slice(0, 16).replace('T', ' '))}  ${esc(a.action)}`).join('<br>') || 'No activity yet.'}</div></section>
   </div>`;
+}
+
+// ---------- agents ----------
+function briefInner(b, pending) {
+  const gen = b.generator === 'rules' ? (pending ? 'AI briefing on its way…' : 'built by rules (no AI key)') : b.generator;
+  return `<h2>${esc(b.headline)}</h2>${b.lines.map((l) => `<p>${esc(l)}</p>`).join('')}
+    <div class="meta" ${pending ? 'data-pending="1"' : ''}>${pending ? '<span class="spin" style="width:10px;height:10px"></span>' : icon('spark')}Daily briefing · ${esc(gen)}</div>`;
+}
+async function loadAiBriefing(seq) {
+  try {
+    const b = await api('/api/briefing', { timeoutMs: 45000 });
+    const el = document.getElementById('brief');
+    if (el && seq === renderSeq) el.innerHTML = briefInner(b, false);
+  } catch {
+    const m = document.querySelector('#brief [data-pending]');
+    if (m) m.innerHTML = `${icon('spark')}Daily briefing · built by rules (AI unavailable right now)`;
+  }
+}
+const OUT_ICON = { draft: 'mail', task: 'plan', doc: 'spark' };
+function outputsChips(outputs) {
+  return (outputs || []).map((o) => `<span class="chip">${icon(OUT_ICON[o.type] || 'spark')}${esc(o.label)}</span>`).join('');
+}
+function agentActivityCard(list) {
+  if (!list.length) return '';
+  return `<section class="card"><div class="card-head">${icon('bot')}<h2>Agent activity</h2><span class="spacer"></span><a class="link" href="#/agents">All</a></div>
+    <ul class="actions">${list.slice(0, 4).map((r) => `<li class="action" data-go="#/deals/${r.collab_id}"><span class="sev" style="background:var(--ai)"></span>
+      <div><div class="t">${esc(r.name)} · ${esc(r.brand)}</div><div class="d">${esc(r.summary || '')}</div><div class="row" style="gap:6px;margin-top:6px">${outputsChips(r.outputs)}</div></div>
+      <span class="chev">${icon('chev')}</span></li>`).join('')}</ul></section>`;
+}
+function agentPanel(d) {
+  const a = d.agent; if (!a) return '';
+  const docs = (d.docs || []).map((doc) => `<div class="doc" data-doc="${doc.id}">
+      <details ${d.docs.length <= 2 ? 'open' : ''}><summary><b>${esc(doc.title)}</b> <span class="badge b-inferred">${icon('bot')}${esc(doc.generator || 'Agent')}</span></summary>
+        <pre class="docbody">${esc(doc.body)}</pre>
+        <div class="docedit" hidden><textarea>${esc(doc.body)}</textarea><div class="row" style="margin-top:8px"><button class="btn btn-sm btn-primary" data-act="doc-save">Save</button></div></div>
+        <div class="row" style="margin-top:8px;gap:6px"><button class="btn btn-sm" data-act="doc-copy">${icon('copy')}Copy</button><button class="btn btn-sm" data-act="doc-edit">Edit</button><span class="spacer"></span><button class="btn btn-sm btn-ghost" data-act="doc-dismiss">Dismiss</button></div>
+      </details></div>`).join('');
+  const runs = (d.agentRuns || []).filter((r) => r.status !== 'queued' && !/moved on/.test(r.summary || '')).slice(0, 4).map((r) => `<li><span class="mono muted">${fmtWhen(r.finished_at || r.created_at)}</span> <b>${esc(r.name)}</b> ${r.status === 'running' ? '<span class="spin" style="width:10px;height:10px"></span> working…' : esc(r.summary || r.status)}</li>`).join('');
+  const queued = (d.agentRuns || []).some((r) => r.status === 'queued' || r.status === 'running');
+  return `<section class="card"><div class="card-head">${icon('bot')}<h2>${esc(a.name)}</h2><span class="small muted">agent for ${esc(STAGE_SHORT[a.stage] || a.stage)}</span><span class="spacer"></span>
+      <button class="btn btn-sm" data-act="agent-run">${queued ? '<span class="spin" style="width:12px;height:12px"></span> Working…' : `Run ${esc(a.name)} now`}</button></div>
+    <div class="card-pad stack">
+      <p class="small muted" style="margin:0">${esc(a.does)}${a.enabled ? '' : ' <b>(Switched off — it only runs when you press the button.)</b>'} Agents prepare work for you; they never send or agree anything.</p>
+      ${docs || '<div class="small muted">Nothing prepared for this stage yet.</div>'}
+      ${runs ? `<ul class="runlog">${runs}</ul>` : ''}
+    </div></section>`;
+}
+function agentToast(r) {
+  const done = (r && r.ran || []).filter((x) => x.status === 'done' && (x.outputs || []).length);
+  if (!done.length) return null;
+  return done.length === 1 ? `${done[0].agent}: ${done[0].summary}` : `Agents prepared work on ${done.length} deals`;
+}
+async function runAgentsNow() {
+  const total = { ran: [] };
+  for (let i = 0; i < 20; i++) {
+    const r = await api('/api/agents/run', { method: 'POST', timeoutMs: 70000 });
+    total.ran.push(...(r.ran || []));
+    if (!r.more) break;
+  }
+  return total;
+}
+let kicking = false;
+/** Let agents work in the background; refresh the page when they've produced something. */
+async function kickAgents() {
+  if (kicking || !state.me) return;
+  kicking = true;
+  try {
+    const r = await runAgentsNow();
+    const msg = agentToast(r);
+    if (msg) {
+      toast(msg);
+      const route = (location.hash.slice(2).split(/[/?]/)[0]) || 'today';
+      if (['today', 'deals', 'planner', 'agents'].includes(route)) render();
+    }
+  } catch { /* the scheduled job will pick it up */ } finally { kicking = false; }
+}
+async function viewAgents() {
+  const d = await api('/api/agents');
+  const r = d.settings.rates || {};
+  const rate = (k, label) => `<label class="field">${label}<input type="number" min="0" step="10" name="${k}" value="${r[k] ?? ''}" placeholder="£"></label>`;
+  return `<div class="page-head"><div><div class="eyebrow">Automation</div><h1>Agents</h1></div><button class="btn" data-act="agents-kick">${icon('bot')}Run waiting agents</button></div>
+    <p class="muted" style="margin-top:-8px;max-width:72ch">When a deal moves into a stage, from email or because you moved it, that stage's agent gets to work. Agents only <b>prepare</b> things: drafts (which still need your approval and confirmation to send), tasks on your Planner, and notes. They never send, accept or agree anything.</p>
+    ${d.ai ? `<div class="banner info">${icon('spark')}<div>AI writing is on (${esc(d.aiLabel)}). Everything AI-written is labelled.</div></div>` : `<div class="banner">${icon('info')}<div>AI writing is off, so agents use fill-in-the-blank templates. Add <span class="mono">ANTHROPIC_API_KEY</span> in Netlify to switch it on.</div></div>`}
+    <div class="agentgrid">${d.agents.map((a) => `<section class="card card-pad agentcard">
+        <div class="row" style="flex-wrap:nowrap"><span class="ic">${icon('bot')}</span><div style="flex:1"><b>${esc(a.name)}</b><div class="small muted">${esc(STAGE_SHORT[a.stage])}</div></div>
+        <label class="switch" title="Run automatically"><input type="checkbox" data-act="agent-toggle" data-stage="${a.stage}" data-name="${esc(a.name)}" ${a.enabled ? 'checked' : ''}><span></span></label></div>
+        <p class="small" style="margin:10px 0 0">${esc(a.does)}</p>
+        <div class="small muted" style="margin-top:8px">${a.runs ? `${a.runs} run${a.runs === 1 ? '' : 's'} so far` : 'Not run yet'}</div></section>`).join('')}</div>
+    <div class="today-grid" style="margin-top:20px">
+      <section class="card"><div class="card-head"><h2>Activity</h2></div>
+        ${d.runs.length ? `<ul class="actions">${d.runs.map((x) => `<li class="action" data-go="#/deals/${x.collab_id}"><span class="sev" style="background:${x.status === 'done' ? 'var(--ai)' : x.status === 'error' ? 'var(--danger)' : 'var(--line-strong)'}"></span>
+          <div><div class="t">${esc(x.name)} · ${esc(x.brand)} <span class="mono muted small">${fmtWhen(x.finished_at || x.created_at)}</span></div>
+          <div class="d">${esc(x.summary || x.status)}${x.trigger === 'time' ? ' (timed check)' : x.trigger === 'manual' ? ' (you asked)' : ''}</div>
+          ${(x.outputs || []).length ? `<div class="row" style="gap:6px;margin-top:6px">${outputsChips(x.outputs)}</div>` : ''}</div><span class="chev">${icon('chev')}</span></li>`).join('')}</ul>`
+        : '<div class="empty">No agent activity yet. It starts when a deal changes stage.</div>'}</section>
+      <section class="card"><div class="card-head"><h2>What the agents know</h2></div><form class="card-pad stack" data-form="agent-settings">
+        <label class="field">Your channel (used by Scout to judge fit)<textarea name="profile" style="min-height:110px" placeholder="e.g. UK YouTube channel of hands-on builds, 3D printing, electronics and DIY. Honest reviews only.">${esc(d.settings.profile || '')}</textarea></label>
+        <div><div class="small" style="font-weight:600;color:var(--ink-2);margin-bottom:6px">Your rate card (£, used by Negotiator)</div>
+          <div class="rates">${rate('dedicated', 'Dedicated video')}${rate('integration', 'Integration')}${rate('short', 'YouTube Short')}${rate('review', 'Review video')}</div></div>
+        <label class="field">Sign emails as<input type="text" name="signoff" value="${esc(d.settings.signoff || '')}" placeholder="Ben"></label>
+        <div><button class="btn btn-primary" type="submit">Save</button></div>
+      </form></section>
+    </div>`;
 }
 
 // ---------- planner ----------
@@ -421,9 +528,10 @@ async function render() {
     try { state.me = await api('/api/me'); } catch (e) { if (seq === renderSeq) { if (e.status === 401 || e.status === 403) return viewLogin(); return showFatal(e); } return; }
     if (seq !== renderSeq) return;
     refreshBadge();
+    setTimeout(kickAgents, 1500); // pick up any timed or queued agent work when the app opens
   }
   const route = parts[0] || 'today';
-  const views = { today: viewToday, planner: viewPlanner, deals: () => (parts[1] ? viewDeal(parts[1]) : viewDeals(params)), calendar: viewCalendar, review: viewReview, assistant: viewAssistant, settings: () => viewSettings(params) };
+  const views = { today: viewToday, planner: viewPlanner, agents: viewAgents, deals: () => (parts[1] ? viewDeal(parts[1]) : viewDeals(params)), calendar: viewCalendar, review: viewReview, assistant: viewAssistant, settings: () => viewSettings(params) };
   const view = views[route] || viewToday;
 
   // Instant feedback: highlight the tapped menu item and show progress straight away.
@@ -440,6 +548,7 @@ async function render() {
     $app.innerHTML = shell(route, html);
     document.getElementById('main').dataset.route = pathPart;
     if (route === 'assistant') { const ch = document.getElementById('chat'); ch.scrollTop = ch.scrollHeight; }
+    if (route === 'today' && document.querySelector('#brief [data-pending]')) loadAiBriefing(seq);
   } catch (e) {
     if (seq !== renderSeq) return;
     if (e.status === 401) { state.me = null; return viewLogin(); }
@@ -480,12 +589,12 @@ const actions = {
     await api('/api/gmail/connect-demo', { method: 'POST' });
     const r = await runSteps('/api/gmail/sync');
     toast(`Demo inbox connected: ${r.collabMessages} collaboration emails, ${r.ignored} other emails skipped`);
-    state.me = await api('/api/me'); location.hash = '#/today'; render();
+    state.me = await api('/api/me'); location.hash = '#/today'; render(); kickAgents();
   }),
   sync: (el) => busy(el, async () => {
     const r = await runSteps('/api/gmail/sync', (t) => t.remaining && toast(`Checking email… ${t.remaining} left`));
     toast(r.collabMessages ? `${r.collabMessages} new collaboration email${r.collabMessages > 1 ? 's' : ''} · ${r.collabsCreated} new deal${r.collabsCreated === 1 ? '' : 's'}` : 'No new collaboration emails');
-    state.me = await api('/api/me'); refreshBadge(); render();
+    state.me = await api('/api/me'); refreshBadge(); render(); kickAgents();
   }),
   'import-history': (el) => busy(el, async () => {
     const r = await runSteps('/api/gmail/import-history', (t) => toast(`Importing… ${t.processed} checked, ${t.remaining} to go`));
@@ -502,7 +611,24 @@ const actions = {
     await busy(el, async () => { await api('/api/gmail/disconnect', { method: 'POST', body: { purge } }); state.me = await api('/api/me'); toast('Gmail disconnected'); render(); });
   },
   filter: (el) => { state.dealFilter = el.dataset.v; render(); },
-  stage: (el) => busy(null, async () => { await api(`/api/collaborations/${dealId()}`, { method: 'PATCH', body: { stage: el.dataset.v } }); toast('Stage updated — set by you'); render(); }),
+  stage: (el) => busy(null, async () => {
+    const r = await api(`/api/collaborations/${dealId()}`, { method: 'PATCH', body: { stage: el.dataset.v } });
+    toast(r.agentQueued ? 'Stage updated — agent starting…' : 'Stage updated — set by you'); render();
+    if (r.agentQueued) kickAgents();
+  }),
+  'agent-run': (el) => busy(el, async () => {
+    const r = await api(`/api/collaborations/${dealId()}/agent`, { method: 'POST', timeoutMs: 70000 });
+    toast(agentToast(r) || 'Agent finished'); render();
+  }),
+  'agent-toggle': (el) => busy(null, async () => { await api('/api/agents/settings', { method: 'POST', body: { enabled: { [el.dataset.stage]: el.checked } } }); toast(`${el.dataset.name} ${el.checked ? 'on' : 'off'}`); }),
+  'agents-kick': (el) => busy(el, async () => { const r = await runAgentsNow(); toast(agentToast(r) || 'Nothing waiting for the agents'); render(); }),
+  'doc-copy': async (el) => {
+    const text = el.closest('[data-doc]').querySelector('textarea, pre').value || el.closest('[data-doc]').querySelector('pre').textContent;
+    try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { toast('Select the text and copy it manually'); }
+  },
+  'doc-edit': (el) => { const box = el.closest('[data-doc]'); const pre = box.querySelector('pre'); box.querySelector('.docedit').hidden = false; pre.hidden = true; el.hidden = true; },
+  'doc-save': (el) => busy(el, async () => { const box = el.closest('[data-doc]'); await api(`/api/docs/${box.dataset.doc}`, { method: 'PUT', body: { body: box.querySelector('textarea').value } }); toast('Saved'); render(); }),
+  'doc-dismiss': (el) => busy(el, async () => { await api(`/api/docs/${el.closest('[data-doc]').dataset.doc}/dismiss`, { method: 'POST' }); render(); }),
   'stage-reset': () => busy(null, async () => { await api(`/api/collaborations/${dealId()}`, { method: 'PATCH', body: { resetStage: true } }); render(); }),
   'draft-new': (el) => busy(el, async () => { await api(`/api/collaborations/${dealId()}/drafts`, { method: 'POST' }); render(); }),
   'draft-save': (el) => busy(el, async () => { await api(`/api/drafts/${draftEl(el).dataset.draft}`, { method: 'PUT', body: draftFields(draftEl(el)) }); toast('Draft saved'); render(); }),
@@ -525,7 +651,7 @@ const actions = {
   },
   'draft-discard': (el) => busy(el, async () => { await api(`/api/drafts/${draftEl(el).dataset.draft}/discard`, { method: 'POST' }); render(); }),
   'task-toggle': (el) => busy(null, async () => { await api(`/api/tasks/${el.dataset.id}`, { method: 'PATCH', body: { done: el.checked } }); render(); }),
-  'review-collab': (el) => busy(el, async () => { await api(`/api/review/collab/${el.closest('[data-review]').dataset.review}`, { method: 'POST', body: { action: el.dataset.v } }); toast(el.dataset.v === 'confirm' ? 'Added to your tracker' : 'Dismissed'); refreshBadge(); render(); }),
+  'review-collab': (el) => busy(el, async () => { await api(`/api/review/collab/${el.closest('[data-review]').dataset.review}`, { method: 'POST', body: { action: el.dataset.v } }); toast(el.dataset.v === 'confirm' ? 'Added to your tracker' : 'Dismissed'); refreshBadge(); render(); kickAgents(); }),
   'review-fact': (el) => busy(el, async () => { await api(`/api/review/fact/${el.closest('[data-fact]').dataset.fact}`, { method: 'POST', body: { action: el.dataset.v } }); refreshBadge(); render(); }),
   'ask-suggest': (el) => askQuestion(el.textContent),
 };
@@ -548,6 +674,11 @@ async function askQuestion(q) {
 }
 const forms = {
   ask: (f) => { const q = f.q.value.trim(); if (q) askQuestion(q); },
+  'agent-settings': (f) => busy(f.querySelector('button[type=submit]'), async () => {
+    const rates = {}; for (const k of ['dedicated', 'integration', 'short', 'review']) if (f[k].value !== '') rates[k] = Number(f[k].value);
+    await api('/api/agents/settings', { method: 'POST', body: { profile: f.profile.value, rates, signoff: f.signoff.value } });
+    toast('Saved — agents will use this from now on');
+  }),
   'plan-task': (f) => busy(f.querySelector('button'), async () => {
     await api('/api/tasks', { method: 'POST', body: { title: f.title.value, dueAt: f.dueAt.value || null, collabId: f.collabId.value || null } });
     toast('Added to your plan'); render();

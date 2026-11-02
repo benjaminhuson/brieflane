@@ -9,10 +9,11 @@ const { norm } = require('../ingest/text');
  */
 function makeLlm(cfg, fetchImpl = globalThis.fetch) {
   const enabled = Boolean(cfg.anthropic.apiKey);
-  async function complete({ system, prompt, maxTokens = 1200 }) {
+  async function complete({ system, prompt, maxTokens = 1200, timeoutMs = 25000 }) {
     if (!enabled) throw new Error('LLM not configured');
     const res = await fetchImpl('https://api.anthropic.com/v1/messages', {
       method: 'POST',
+      signal: AbortSignal.timeout(timeoutMs),
       headers: { 'content-type': 'application/json', 'x-api-key': cfg.anthropic.apiKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({ model: cfg.anthropic.model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: prompt }] }),
     });
@@ -50,11 +51,17 @@ async function llmExtract(llm, msg, heuristic) {
       maxTokens: 1000,
     });
     const fullText = `${msg.subject || ''}. ${heuristic.text}`;
-    const facts = heuristic.facts.filter((f) => f.kind === 'contact');
+    // Start from the rule-based facts (each already quote-checked) and add what the AI found on top,
+    // so a thin or failed AI answer can never lose details the rules caught.
+    const facts = [...heuristic.facts];
+    const seen = new Set(facts.map((f) => f.valueKey));
     for (const f of out.facts || []) {
       if (!KINDS.has(f.kind) || !f.value) continue;
       const verified = verifyQuote(f.quote, fullText);
       const due = f.due_date && /^\d{4}-\d{2}-\d{2}$/.test(f.due_date) ? `${f.due_date}T17:00:00.000Z` : null;
+      const valueKey = `${f.kind}:${norm(f.value)}`;
+      if (seen.has(valueKey)) continue;
+      seen.add(valueKey);
       facts.push({
         kind: f.kind, label: String(f.label || f.kind).slice(0, 80), value: String(f.value).slice(0, 300),
         slot: f.kind === 'deadline' ? `deadline:${f.label}` : f.kind === 'payment' ? 'payment:fee' : `${f.kind}:${norm(f.value)}`,

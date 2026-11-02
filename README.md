@@ -33,6 +33,7 @@ Without Google credentials the app runs against a clearly labelled **demo inbox*
 | Area | Detail |
 |---|---|
 | Dashboard | Daily briefing (rules; AI-written when a key is set), urgent actions with severity + reason + evidence basis, 5-week agenda, pipeline counts |
+| Agents | One agent per stage (Scout, Negotiator, Logistics, Producer, Editor, Publisher, Closer) runs when a deal enters that stage, plus timed checks (5-day nudge, shipping chase). They prepare drafts, Planner tasks and notes (fit check, offer vs rate card, shot list, script outline, brand checklist, video description); never send or agree anything. On/off per agent, channel profile, rate card, activity feed |
 | Planner | One row per project across a 6-week grid: dates from email, proposed (dashed) dates, your tasks and suggested next steps; add tasks to the plan; card list on mobile |
 | Tracker | 7 stages (new → negotiating → awaiting delivery → ready to film → editing → scheduled → published); kanban on desktop, filtered list on mobile |
 | Deal detail | Facts grouped by money / deliverables / dates / shipping / product / contacts, each badged **From email** (with verbatim quote), **AI-inferred**, or **Set by you**; agreement panel (needs agreement wording from *both* sides to say so); superseded-value history; linked email thread; tasks; add-your-own facts |

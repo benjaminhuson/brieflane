@@ -5,6 +5,8 @@ const { SCOPES, COLLAB_QUERY, authUrl, makeGoogle, makeGmailClient } = require('
 const { makeDemoProvider } = require('./gmail/demo');
 const { ingestOne, newStats, finishStats, refreshDerived } = require('./ingest/pipeline');
 const { CHECK } = require('./ai/drafts');
+const agents = require('./agents');
+const { briefing, computeAttention } = require('./ai/attention');
 
 const nowIso = () => new Date().toISOString();
 const httpErr = (status, message, extra = {}) => Object.assign(new Error(message), { status, ...extra });
@@ -46,6 +48,9 @@ function makeServices({ cfg, db, llm, fetchImpl = globalThis.fetch, clock = () =
     if (!user) {
       user = await createTenantWithUser({ email: DEMO_EMAIL, name: 'Ben', tenantName: 'Huson DIY (demo workspace)' });
       await seedHistoricalNotes(forTenant(db, user.tenant_id));
+      await forTenant(db, user.tenant_id).saveAgentSettings({
+        profile: 'Huson DIY: UK YouTube channel of hands-on builds, 3D printing, electronics, workshop tools and DIY projects. Honest reviews, editorial control kept.',
+        rates: { dedicated: 1200, integration: 750, short: 250, review: 600 }, signoff: 'Ben' });
     }
     return user;
   }
@@ -174,7 +179,8 @@ function makeServices({ cfg, db, llm, fetchImpl = globalThis.fetch, clock = () =
     const ctx = { db, repo, llm, now: clock() };
     let done = 0;
     while (done < todo.length && (done === 0 || Date.now() - started < budgetMs)) { // always make progress
-      const batch = todo.slice(done, done + 5);
+      // Small batches: with AI extraction on, each email can take a few seconds to read.
+      const batch = todo.slice(done, done + (llm.enabled ? 3 : 5));
       const msgs = await Promise.all(batch.map((gid) => p.get(gid)));
       for (const m of msgs) if (m) await ingestOne(ctx, m, kind === 'history' ? 'history' : 'sync', stats);
       done += batch.length;
@@ -185,19 +191,49 @@ function makeServices({ cfg, db, llm, fetchImpl = globalThis.fetch, clock = () =
     return { ...finishStats(stats), processed: done, remaining: todo.length - done, more };
   }
 
-  /** Netlify scheduled function: keep every connected inbox fresh without anyone pressing a button. */
-  async function scheduledSync({ budgetMs = 20000 } = {}) {
+  /** Netlify scheduled function: keep every connected inbox fresh and let agents work, without anyone pressing a button. */
+  async function scheduledSync({ budgetMs = 22000 } = {}) {
     const started = Date.now();
+    const left = () => budgetMs - (Date.now() - started);
     const rows = await db.query("SELECT tenant_id FROM gmail_connections WHERE mode='google' ORDER BY COALESCE(last_sync_at,'') ASC");
     const results = [];
     for (const { tenant_id: tid } of rows) {
-      const left = budgetMs - (Date.now() - started);
-      if (left < 3000) break;
-      try { results.push({ tid, ...(await syncStep(forTenant(db, tid), null, 'recent', { budgetMs: Math.min(left - 2000, 8000) })) }); }
+      if (left() < 8000) break;
+      try { results.push({ tid, ...(await syncStep(forTenant(db, tid), null, 'recent', { budgetMs: Math.min(left() - 6000, 8000) })) }); }
       catch (e) { results.push({ tid, error: e.message }); }
     }
-    await runRetention();
+    // Agents: time-based triggers for connected tenants, then work through any queued runs.
+    for (const { tenant_id: tid } of rows) {
+      if (left() < 6000) break;
+      try { const repo = forTenant(db, tid); await agents.queueTimeAgents(repo, await repo.snapshot(), clock()); } catch { /* next tenant */ }
+    }
+    const queued = await db.query("SELECT DISTINCT tenant_id FROM agent_runs WHERE status IN ('queued','running')");
+    for (const { tenant_id: tid } of queued) {
+      if (left() < 6000) break;
+      try { results.push({ tid, agents: (await agents.processAgents(forTenant(db, tid), llm, { budgetMs: Math.min(left() - 5000, 12000), now: clock })).ran.length }); }
+      catch (e) { results.push({ tid, agentError: e.message }); }
+    }
+    if (left() > 2000) await runRetention();
     return results;
+  }
+
+  /** Called by the app after anything that may have queued agent work. */
+  async function runAgentsStep(repo, { budgetMs = cfg.isServerless ? 35000 : 60000 } = {}) {
+    await agents.queueTimeAgents(repo, await repo.snapshot(), clock());
+    return agents.processAgents(repo, llm, { budgetMs, now: clock });
+  }
+
+  /** AI briefing, cached per tenant until the attention list changes (or 6 hours pass). */
+  async function aiBriefing(repo, name) {
+    const now = clock();
+    const snap = await repo.snapshot();
+    const items = computeAttention(snap, now);
+    const hash = require('./crypto').sha256(JSON.stringify([now.toISOString().slice(0, 10), now.getUTCHours() < 12 ? 'am' : now.getUTCHours() < 18 ? 'pm' : 'eve', items.map((i) => [i.id, i.title, i.detail])]));
+    const cached = await repo.cachedBriefing();
+    if (cached && cached.hash === hash && now - new Date(cached.created_at) < 6 * 3600e3) return JSON.parse(cached.body);
+    const b = await briefing(snap, llm, { now, name, items });
+    if (b.generator !== 'rules') await repo.saveBriefing(hash, b);
+    return b;
   }
 
   // ---------------- Drafts: human-in-the-loop sending ----------------
@@ -285,6 +321,9 @@ function makeServices({ cfg, db, llm, fetchImpl = globalThis.fetch, clock = () =
       drafts: await q('SELECT * FROM drafts WHERE tenant_id=?'),
       tasks: await q('SELECT * FROM tasks WHERE tenant_id=?'),
       audit: await q('SELECT action, detail, at FROM audit WHERE tenant_id=? ORDER BY id'),
+      agentSettings: await q('SELECT enabled, profile, rates, signoff, updated_at FROM agent_settings WHERE tenant_id=?'),
+      agentRuns: await q('SELECT * FROM agent_runs WHERE tenant_id=? ORDER BY created_at'),
+      agentDocs: await q('SELECT * FROM deal_docs WHERE tenant_id=? ORDER BY created_at'),
     };
   }
   async function disconnectGmail(repo, userId, { purge = false } = {}) {
@@ -317,7 +356,7 @@ function makeServices({ cfg, db, llm, fetchImpl = globalThis.fetch, clock = () =
 
   return {
     cipher, google, demo, isDemoUser, createTenantWithUser, createSession, sessionFromToken, destroySession, devLogin, seedHistoricalNotes,
-    startOAuth, finishOAuth, provider, connectDemo, enableDemoSend, canSend, syncStep, scheduledSync,
+    startOAuth, finishOAuth, provider, connectDemo, enableDemoSend, canSend, syncStep, scheduledSync, runAgentsStep, aiBriefing,
     editDraft, approveDraft, sendDraft, reviewCollab, reviewFact, exportData, disconnectGmail, deleteAccount, runRetention,
   };
 }

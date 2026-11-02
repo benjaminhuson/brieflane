@@ -154,13 +154,64 @@ CREATE TABLE IF NOT EXISTS audit (
   at TEXT NOT NULL
 );
 
+-- ---------- Agents ----------
+CREATE TABLE IF NOT EXISTS agent_settings (
+  tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+  enabled TEXT NOT NULL DEFAULT '{}',   -- JSON map: stage -> boolean (missing = on)
+  profile TEXT,                         -- channel description used by the Scout
+  rates TEXT,                           -- JSON rate card: { dedicated, integration, short, review }
+  signoff TEXT,
+  updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_runs (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  collab_id TEXT NOT NULL REFERENCES collaborations(id) ON DELETE CASCADE,
+  agent TEXT NOT NULL,                  -- the stage id the agent belongs to
+  stage TEXT NOT NULL,                  -- stage the deal was in when queued
+  run_key TEXT NOT NULL,                -- enter:<stage> | nudge:<ts> | chase:1 | manual:<ts>  (dedupe)
+  trigger TEXT NOT NULL,                -- stage | time | manual
+  status TEXT NOT NULL DEFAULT 'queued',-- queued | running | done | skipped | error
+  summary TEXT,
+  outputs TEXT,                         -- JSON [{ type: draft|task|doc, id, label }]
+  generator TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  UNIQUE (tenant_id, collab_id, run_key)
+);
+CREATE INDEX IF NOT EXISTS agent_runs_queue ON agent_runs(status, created_at);
+CREATE TABLE IF NOT EXISTS deal_docs (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  collab_id TEXT NOT NULL REFERENCES collaborations(id) ON DELETE CASCADE,
+  run_id TEXT,
+  kind TEXT NOT NULL,                   -- fit_check | offer | shot_list | script_outline | requirements | description
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  generator TEXT,
+  dismissed INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS deal_docs_collab ON deal_docs(tenant_id, collab_id);
+CREATE TABLE IF NOT EXISTS briefings (
+  tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+  hash TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS source TEXT;
+ALTER TABLE drafts ADD COLUMN IF NOT EXISTS source TEXT;
+
 -- Supabase exposes the public schema through its REST API. Brieflane never uses that API:
 -- RLS with no policies + revoked grants means the anon/authenticated keys can read nothing.
 -- The server connects as the table owner (bypasses RLS); tenant isolation is enforced in src/repo.js.
 DO $$
 DECLARE t TEXT;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['tenants','users','sessions','oauth_states','gmail_connections','messages','collaborations','collab_threads','facts','tasks','drafts','audit'] LOOP
+  FOREACH t IN ARRAY ARRAY['tenants','users','sessions','oauth_states','gmail_connections','messages','collaborations','collab_threads','facts','tasks','drafts','audit','agent_settings','agent_runs','deal_docs','briefings'] LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
       EXECUTE format('REVOKE ALL ON %I FROM anon, authenticated', t);

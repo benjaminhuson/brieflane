@@ -4,6 +4,7 @@ const { extract, inferStage } = require('./extract');
 const { brandKey } = require('./text');
 const { llmExtract } = require('../ai/llm');
 const { STAGES } = require('../repo');
+const agents = require('../agents');
 
 const AUTO_STAGES = ['new', 'negotiating', 'awaiting_delivery', 'ready_to_film'];
 const HISTORICAL_AGE_DAYS = 30;
@@ -48,8 +49,9 @@ async function ingestOne({ repo, llm, now }, msg, via, stats) {
     if (!collab && msg.direction === 'in') collab = await r.openCollabByBrand(brandKey(ex.brand));
     if (!collab && msg.direction === 'out') { await skip(r); stats.ignored++; return; } // outbound mail outside tracked threads: id only
 
-    let cid;
+    let cid; let created = false;
     if (!collab) {
+      created = true;
       cid = await r.createCollab({ brand: ex.brand, brandKey: brandKey(ex.brand), agency: ex.agency, product: ex.product, kind: cls.kind,
         needsReview: historical, isDemo: msg.isDemo, createdAt: msg.sentAt });
       stats.collabsCreated++;
@@ -68,6 +70,9 @@ async function ingestOne({ repo, llm, now }, msg, via, stats) {
     ]);
     collab = fresh;
     stats.collabMessages++; stats.collabsUpdated.add(cid);
+    if (created && !fresh.needs_review) {
+      if (await agents.onStageEntered(r, { ...fresh, last_inbound_at: msg.sentAt }, 'new', { now })) stats.agentsQueued = (stats.agentsQueued || 0) + 1;
+    }
 
     const review = historical || Boolean(collab.needs_review);
     const candidates = [];
@@ -133,6 +138,8 @@ async function refreshDerived(repo, cid, { now = new Date(), collab = null, extr
   const na = suggestNextAction({ ...c, ...patch, stage }, messages, facts, now);
   patch.next_action = na.text; patch.next_action_due = na.due;
   await repo.updateCollab(cid, patch);
+  // Stage advanced (inferred from email): queue that stage's agent.
+  if (patch.stage && patch.stage !== c0.stage) await agents.onStageEntered(repo, { ...c, ...patch }, patch.stage, { now });
 }
 
 function suggestNextAction(c, messages, facts, now) {
@@ -159,9 +166,12 @@ function suggestNextAction(c, messages, facts, now) {
 /** Creator sets a stage manually: it sticks, and auto-inference stops for this collaboration. */
 async function setStageByUser(repo, cid, stage, userId) {
   if (!STAGES.includes(stage)) throw Object.assign(new Error('invalid stage'), { status: 400 });
+  const before = await repo.collab(cid);
   await repo.updateCollab(cid, { stage, stage_basis: 'user', stage_reason: 'Set by you', stage_evidence_msg: null });
   await refreshDerived(repo, cid);
   await repo.audit(userId, 'stage.set', { cid, stage });
+  if (before && before.stage !== stage) return agents.onStageEntered(repo, { ...before, stage }, stage, { byUser: true });
+  return false;
 }
 
 module.exports = { ingestMessages, ingestOne, newStats, finishStats, refreshDerived, setStageByUser, suggestNextAction };

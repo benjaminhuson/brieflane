@@ -148,7 +148,7 @@ function forTenant(db, tenantId) {
     tasks: ({ includeDone = false } = {}) => all(`SELECT * FROM tasks WHERE tenant_id=? ${includeDone ? '' : 'AND done=0'} ORDER BY COALESCE(due_at,'9999') ASC`),
     async addTask(t) {
       const tid = id('tsk');
-      await run('INSERT INTO tasks (tenant_id, id, collab_id, title, due_at, created_at) VALUES (?,?,?,?,?,?)', tid, t.collabId, t.title, t.dueAt, now());
+      await run('INSERT INTO tasks (tenant_id, id, collab_id, title, due_at, source, created_at) VALUES (?,?,?,?,?,?,?)', tid, t.collabId, t.title, t.dueAt, t.source, now());
       return tid;
     },
     setTaskDone: (tid, done) => db.run('UPDATE tasks SET done=? WHERE tenant_id=? AND id=?', [done ? 1 : 0, T, tid]),
@@ -161,8 +161,8 @@ function forTenant(db, tenantId) {
     draft: (did) => one('SELECT * FROM drafts WHERE tenant_id=? AND id=?', did),
     async addDraft(d) {
       const did = id('drf'); const t = now();
-      await run(`INSERT INTO drafts (tenant_id, id, collab_id, thread_id, reply_to_msg, to_addr, subject, body, status, generator, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,'draft',?,?,?)`, did, d.collabId, d.threadId, d.replyToMsg, d.toAddr, d.subject, d.body, d.generator, t, t);
+      await run(`INSERT INTO drafts (tenant_id, id, collab_id, thread_id, reply_to_msg, to_addr, subject, body, status, generator, source, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,'draft',?,?,?,?)`, did, d.collabId, d.threadId, d.replyToMsg, d.toAddr, d.subject, d.body, d.generator, d.source, t, t);
       return did;
     },
     async updateDraft(did, patch) {
@@ -209,6 +209,62 @@ function forTenant(db, tenantId) {
       const mBy = {}; for (const m of msgs) (mBy[m.collab_id] ||= []).push(m);
       return { collabs: collabs.map((c) => ({ ...c, facts: fBy[c.id] || [], messages: mBy[c.id] || [] })), facts: pending };
     },
+
+    // ---------- Agents ----------
+    async agentSettings() {
+      const r = await one('SELECT * FROM agent_settings WHERE tenant_id=?');
+      const parse = (v, d) => { try { return v ? JSON.parse(v) : d; } catch { return d; } };
+      return { enabled: parse(r && r.enabled, {}), profile: (r && r.profile) || '', rates: parse(r && r.rates, {}), signoff: (r && r.signoff) || '' };
+    },
+    async saveAgentSettings({ enabled, profile, rates, signoff }) {
+      const cur = await repo.agentSettings();
+      const next = { enabled: { ...cur.enabled, ...(enabled || {}) }, profile: profile ?? cur.profile, rates: rates ?? cur.rates, signoff: signoff ?? cur.signoff };
+      await run(`INSERT INTO agent_settings (tenant_id, enabled, profile, rates, signoff, updated_at) VALUES (?,?,?,?,?,?)
+        ON CONFLICT (tenant_id) DO UPDATE SET enabled=excluded.enabled, profile=excluded.profile, rates=excluded.rates, signoff=excluded.signoff, updated_at=excluded.updated_at`,
+      JSON.stringify(next.enabled), next.profile, JSON.stringify(next.rates), next.signoff, now());
+      return next;
+    },
+    /** Queue an agent run once per (deal, run_key). Returns true if newly queued. */
+    async enqueueAgent({ collabId, agent, stage, runKey, trigger }) {
+      const r = await run(`INSERT INTO agent_runs (tenant_id, id, collab_id, agent, stage, run_key, trigger, status, created_at)
+        VALUES (?,?,?,?,?,?,?,'queued',?) ON CONFLICT (tenant_id, collab_id, run_key) DO NOTHING`, id('run'), collabId, agent, stage, runKey, trigger, now());
+      return r.count > 0;
+    },
+    /** Atomically claim the oldest queued run (safe if two processors overlap). */
+    async claimAgentRun() {
+      const rows = await db.query(`UPDATE agent_runs SET status='running', started_at=? WHERE id = (
+          SELECT id FROM agent_runs WHERE tenant_id=? AND (status='queued' OR (status='running' AND started_at < ?))
+          ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`, [now(), T, new Date(Date.now() - 5 * 60e3).toISOString()]);
+      return rows[0] || null;
+    },
+    finishAgentRun: (rid, { status, summary, outputs, generator, error }) => db.run(
+      'UPDATE agent_runs SET status=?, summary=?, outputs=?, generator=?, error=?, finished_at=? WHERE tenant_id=? AND id=?',
+      [status, summary, outputs ? JSON.stringify(outputs) : null, generator, error, now(), T, rid]),
+    queuedAgentCount: async () => (await one("SELECT COUNT(*)::int AS n FROM agent_runs WHERE tenant_id=? AND status IN ('queued','running')")).n,
+    agentRuns: (limit = 30) => all(`SELECT r.*, c.brand FROM agent_runs r JOIN collaborations c ON c.id=r.collab_id
+        WHERE r.tenant_id=? AND (r.status IN ('done','error','running') OR (r.status='skipped' AND r.summary NOT LIKE '%moved on%'))
+        ORDER BY COALESCE(r.finished_at, r.created_at) DESC LIMIT ?`, limit),
+    agentRunCounts: () => all("SELECT agent, COUNT(*)::int AS n FROM agent_runs WHERE tenant_id=? AND status='done' GROUP BY agent"),
+    agentRunsFor: (cid) => all('SELECT * FROM agent_runs WHERE tenant_id=? AND collab_id=? ORDER BY created_at DESC LIMIT 20', cid),
+    agentRunFor: (cid, runKey) => one('SELECT * FROM agent_runs WHERE tenant_id=? AND collab_id=? AND run_key=?', cid, runKey),
+    recentAgentActivity: (sinceIso) => all(`SELECT r.id, r.agent, r.summary, r.outputs, r.finished_at, r.collab_id, c.brand FROM agent_runs r
+        JOIN collaborations c ON c.id=r.collab_id WHERE r.tenant_id=? AND r.status='done' AND r.finished_at > ? AND c.archived=0
+        ORDER BY r.finished_at DESC LIMIT 6`, sinceIso),
+    docs: (cid) => all('SELECT * FROM deal_docs WHERE tenant_id=? AND collab_id=? AND dismissed=0 ORDER BY created_at DESC', cid),
+    doc: (did) => one('SELECT * FROM deal_docs WHERE tenant_id=? AND id=?', did),
+    async addDoc(d) {
+      const did = id('doc'); const t = now();
+      // One live doc per kind per deal: a fresh run replaces the previous version.
+      await run('UPDATE deal_docs SET dismissed=1 WHERE tenant_id=? AND collab_id=? AND kind=? AND dismissed=0', d.collabId, d.kind);
+      await run(`INSERT INTO deal_docs (tenant_id, id, collab_id, run_id, kind, title, body, generator, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`, did, d.collabId, d.runId, d.kind, d.title, d.body, d.generator, t, t);
+      return did;
+    },
+    updateDoc: (did, patch) => db.run('UPDATE deal_docs SET body=COALESCE(?, body), dismissed=COALESCE(?, dismissed), updated_at=? WHERE tenant_id=? AND id=?',
+      [patch.body ?? null, patch.dismissed ?? null, now(), T, did]),
+    cachedBriefing: () => one('SELECT * FROM briefings WHERE tenant_id=?'),
+    saveBriefing: (hash, body) => run(`INSERT INTO briefings (tenant_id, hash, body, created_at) VALUES (?,?,?,?)
+        ON CONFLICT (tenant_id) DO UPDATE SET hash=excluded.hash, body=excluded.body, created_at=excluded.created_at`, hash, JSON.stringify(body), now()),
 
     // ---------- Audit ----------
     audit: (userId, action, detail) => db.run('INSERT INTO audit (tenant_id, user_id, action, detail, at) VALUES (?,?,?,?,?)',

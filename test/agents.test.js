@@ -149,3 +149,21 @@ test('with an AI key, agents use the AI and its output is labelled', async (t) =
   assert.match(fil.docs.find((d) => d.kind === 'fit_check').body, /STRONG/);
   assert.equal(fil.drafts.find((d) => d.source === 'agent:new').generator, 'Scout · AI');
 });
+
+test('Test AI: sends the right auth headers and explains failures in plain English', async (t) => {
+  let seen;
+  const okFetch = async (url, opts) => { seen = opts.headers; return { ok: true, json: async () => ({ content: [{ type: 'text', text: 'OK' }] }) }; };
+  const s = await startApp({ ANTHROPIC_API_KEY: 'sk-ant-test', ANTHROPIC_WORKSPACE_ID: 'wrkspc_1' }, { fetchImpl: okFetch }); t.after(s.close);
+  const c = s.client(); await c.login();
+  const r = await c.req('POST', '/api/ai/test');
+  assert.equal(r.data.ok, true);
+  assert.equal(seen.authorization, 'Bearer sk-ant-test');
+  assert.equal(seen['anthropic-workspace-id'], 'wrkspc_1');
+
+  const badFetch = async () => ({ ok: false, status: 400, json: async () => ({ error: { message: 'This API key is not scoped to a workspace, so this request must include the anthropic-workspace-id header' } }) });
+  const s2 = await startApp({ ANTHROPIC_API_KEY: 'sk-ant-test' }, { fetchImpl: badFetch }); t.after(s2.close);
+  const c2 = s2.client(); await c2.login();
+  const r2 = await c2.req('POST', '/api/ai/test');
+  assert.equal(r2.data.ok, false);
+  assert.match(r2.data.message, /create the key inside a workspace/);
+});

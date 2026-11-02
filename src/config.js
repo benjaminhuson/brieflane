@@ -43,7 +43,7 @@ function loadConfig(overrides = {}) {
     allowDevLogin: !isProd || env.DEMO_LOGIN === '1' || env.ALLOW_DEV_LOGIN === '1',
     // Private beta: only these Google accounts may sign in (comma-separated). Empty = anyone.
     allowedEmails: (env.ALLOWED_EMAILS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean),
-    anthropic: { apiKey: env.ANTHROPIC_API_KEY || '', model: env.ANTHROPIC_MODEL || 'claude-sonnet-5-5' },
+    anthropic: { apiKey: env.ANTHROPIC_API_KEY || '', model: env.ANTHROPIC_MODEL || 'claude-sonnet-5-5', workspaceId: env.ANTHROPIC_WORKSPACE_ID || '' },
     sessionTtlDays: Number(env.SESSION_TTL_DAYS) || 30,
     defaultRetentionDays: Number(env.DEFAULT_RETENTION_DAYS) || 400,
     historicalImportDays: 365,

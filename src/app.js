@@ -130,6 +130,19 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
     await ctx.repo.audit(ctx.session.user_id, 'agents.settings');
     return saved;
   });
+  route('POST', '/api/ai/test', {}, async (ctx) => {
+    limit(`ai:${ctx.session.tenant_id}`, 10);
+    if (!llm.enabled) return { ok: false, message: 'No AI key is set. Add ANTHROPIC_API_KEY in Netlify, then redeploy.' };
+    const t0 = Date.now();
+    try {
+      const out = await llm.complete({ system: 'Reply with the single word OK.', prompt: 'Test', maxTokens: 5, timeoutMs: 20000 });
+      return { ok: true, message: `AI is working (${llm.label}, replied in ${((Date.now() - t0) / 1000).toFixed(1)}s): ${out.trim().slice(0, 20)}` };
+    } catch (e) {
+      const hint = /workspace/i.test(e.message) ? ' Fix: create the key inside a workspace, or add ANTHROPIC_WORKSPACE_ID in Netlify.'
+        : e.status === 401 ? ' The key looks wrong or revoked; paste it again in Netlify.' : /credit|billing|balance/i.test(e.message) ? ' Add credit in the Claude Console billing page.' : '';
+      return { ok: false, message: `${e.message}.${hint}` };
+    }
+  });
   route('POST', '/api/agents/run', {}, async (ctx) => { limit(`agents:${ctx.session.tenant_id}`, 60); return svc.runAgentsStep(ctx.repo); });
   route('POST', '/api/collaborations/:id/agent', {}, async (ctx) => {
     limit(`agents:${ctx.session.tenant_id}`, 60);

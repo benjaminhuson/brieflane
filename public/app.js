@@ -423,7 +423,7 @@ async function viewAgents() {
   const rate = (k, label) => `<label class="field">${label}<input type="number" min="0" step="10" name="${k}" value="${r[k] ?? ''}" placeholder="£"></label>`;
   return `<div class="page-head"><div><div class="eyebrow">Automation</div><h1>Agents</h1></div><button class="btn" data-act="agents-kick">${icon('bot')}Run waiting agents</button></div>
     <p class="muted" style="margin-top:-8px;max-width:72ch">When a deal moves into a stage, from email or because you moved it, that stage's agent gets to work. Agents only <b>prepare</b> things: drafts (which still need your approval and confirmation to send), tasks on your Planner, and notes. They never send, accept or agree anything.</p>
-    ${d.ai ? `<div class="banner info">${icon('spark')}<div>AI writing is on (${esc(d.aiLabel)}). Everything AI-written is labelled.</div></div>` : `<div class="banner">${icon('info')}<div>AI writing is off, so agents use fill-in-the-blank templates. Add <span class="mono">ANTHROPIC_API_KEY</span> in Netlify to switch it on.</div></div>`}
+    ${d.ai ? `<div class="banner info">${icon('spark')}<div style="flex:1">AI writing is on (${esc(d.aiLabel)}). Everything AI-written is labelled.</div><button class="btn btn-sm" data-act="ai-test">Test AI</button></div>` : `<div class="banner">${icon('info')}<div>AI writing is off, so agents use fill-in-the-blank templates. Add <span class="mono">ANTHROPIC_API_KEY</span> in Netlify to switch it on.</div></div>`}
     <div class="agentgrid">${d.agents.map((a) => `<section class="card card-pad agentcard">
         <div class="row" style="flex-wrap:nowrap"><span class="ic">${icon('bot')}</span><div style="flex:1"><b>${esc(a.name)}</b><div class="small muted">${esc(STAGE_SHORT[a.stage])}</div></div>
         <label class="switch" title="Run automatically"><input type="checkbox" data-act="agent-toggle" data-stage="${a.stage}" data-name="${esc(a.name)}" ${a.enabled ? 'checked' : ''}><span></span></label></div>
@@ -621,6 +621,7 @@ const actions = {
     toast(agentToast(r) || 'Agent finished'); render();
   }),
   'agent-toggle': (el) => busy(null, async () => { await api('/api/agents/settings', { method: 'POST', body: { enabled: { [el.dataset.stage]: el.checked } } }); toast(`${el.dataset.name} ${el.checked ? 'on' : 'off'}`); }),
+  'ai-test': (el) => busy(el, async () => { const r = await api('/api/ai/test', { method: 'POST', timeoutMs: 30000 }); toast(r.message); }),
   'agents-kick': (el) => busy(el, async () => { const r = await runAgentsNow(); toast(agentToast(r) || 'Nothing waiting for the agents'); render(); }),
   'doc-copy': async (el) => {
     const text = el.closest('[data-doc]').querySelector('textarea, pre').value || el.closest('[data-doc]').querySelector('pre').textContent;

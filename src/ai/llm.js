@@ -14,10 +14,17 @@ function makeLlm(cfg, fetchImpl = globalThis.fetch) {
     const res = await fetchImpl('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       signal: AbortSignal.timeout(timeoutMs),
-      headers: { 'content-type': 'application/json', 'x-api-key': cfg.anthropic.apiKey, 'anthropic-version': '2023-06-01' },
+      headers: {
+        'content-type': 'application/json', authorization: `Bearer ${cfg.anthropic.apiKey}`, 'anthropic-version': '2023-06-01',
+        ...(cfg.anthropic.workspaceId ? { 'anthropic-workspace-id': cfg.anthropic.workspaceId } : {}),
+      },
       body: JSON.stringify({ model: cfg.anthropic.model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: prompt }] }),
     });
-    if (!res.ok) throw new Error(`LLM error ${res.status}`);
+    if (!res.ok) {
+      let detail = '';
+      try { const j = await res.json(); detail = (j.error && j.error.message) || ''; } catch { /* ignore */ }
+      throw Object.assign(new Error(`AI request failed (${res.status})${detail ? `: ${detail}` : ''}`), { status: res.status });
+    }
     const data = await res.json();
     return (data.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('');
   }

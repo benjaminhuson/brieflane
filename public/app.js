@@ -16,12 +16,22 @@ const fmtWhen = (iso) => {
 const daysUntil = (iso) => Math.ceil((new Date(iso) - Date.now()) / 864e5);
 function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 3200); }
 
-async function api(path, { method = 'GET', body } = {}) {
+async function api(path, { method = 'GET', body, timeoutMs = 30000 } = {}) {
   const headers = { 'content-type': 'application/json' };
   if (method !== 'GET' && state.me) headers['x-csrf-token'] = state.me.csrf;
-  const res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(path, { method, headers, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin', signal: ctrl.signal });
+  } catch (e) {
+    throw Object.assign(new Error(e.name === 'AbortError' ? 'Brieflane is taking too long to respond. Check your connection and try again.' : "Couldn't reach Brieflane. Check your connection and try again."), { status: 0, network: true });
+  } finally { clearTimeout(timer); }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error(data.error || `Error ${res.status}`), { status: res.status, data });
+  if (!res.ok) {
+    const msg = data.error || (res.status === 502 || res.status === 504 ? 'The server timed out. Please try again.' : `Something went wrong (error ${res.status}).`);
+    throw Object.assign(new Error(msg), { status: res.status, data });
+  }
   return data;
 }
 
@@ -41,6 +51,8 @@ const P = {
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
   shield: '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v5h1"/>',
+  plan: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 13h6M8 16.5h9"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
   flask: '<path d="M9 3h6M10 3v6L4.5 18.5A2 2 0 0 0 6.2 21h11.6a2 2 0 0 0 1.7-2.5L14 9V3"/>',
 };
 const icon = (n) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[n]}</svg>`;
@@ -54,16 +66,28 @@ const badge = (basis, text) => { const [cls, ic, label] = BASIS[basis] || BASIS.
 const demoBadge = '<span class="badge b-demo">Demo data</span>';
 
 // ---------- layout ----------
-const NAV = [['today', 'Today', 'today'], ['deals', 'Deals', 'deals'], ['calendar', 'Calendar', 'cal'], ['review', 'Review', 'review'], ['assistant', 'Ask', 'ask'], ['settings', 'Settings', 'settings']];
-function shell(route, inner) {
+const NAV = [['today', 'Today', 'today'], ['planner', 'Planner', 'plan'], ['deals', 'Deals', 'deals'], ['calendar', 'Calendar', 'cal'], ['review', 'Review', 'review'], ['assistant', 'Ask', 'ask'], ['settings', 'Settings', 'settings']];
+const TABS = ['today', 'planner', 'deals', 'review', 'assistant', 'settings'];
+function navLinks(route) {
   const rc = state.reviewCount || 0;
-  const nav = NAV.map(([r, label, ic]) => `<a href="#/${r}" ${route === r ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span>${r === 'review' && rc ? `<span class="count">${rc}</span>` : ''}</a>`).join('');
-  const tabs = NAV.filter(([r]) => r !== 'calendar').map(([r, label, ic]) => `<a href="#/${r}" ${route === r ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span>${r === 'review' && rc ? '<i class="dot"></i>' : ''}</a>`).join('');
+  const nav = NAV.map(([r, label, ic]) => `<a href="#/${r}" data-route="${r}" ${route === r ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span>${r === 'review' && rc ? `<span class="count">${rc}</span>` : ''}</a>`).join('');
+  const tabs = NAV.filter(([r]) => TABS.includes(r)).map(([r, label, ic]) => `<a href="#/${r}" data-route="${r}" ${route === r ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span>${r === 'review' && rc ? '<i class="dot"></i>' : ''}</a>`).join('');
+  return { nav, tabs };
+}
+function shell(route, inner) {
+  const { nav, tabs } = navLinks(route);
   return `<div class="shell">
+    <div class="progress" aria-hidden="true"></div>
     <aside class="side"><a class="brand" href="#/today"><img src="/icon.svg" width="28" height="28" alt="">Brieflane</a><nav class="nav">${nav}</nav>
       <div class="side-foot"><b>${esc(state.me.tenant.name)}</b><br>${esc(state.me.user.email)}<br><button class="link" data-act="logout">Sign out</button></div></aside>
     <main id="main">${inner}</main>
     <nav class="tabbar">${tabs}</nav></div>`;
+}
+/** Update the menus in place (instant feedback on tap) without re-rendering the page. */
+function updateNav(route) {
+  const { nav, tabs } = navLinks(route);
+  const n = document.querySelector('.nav'); if (n) n.innerHTML = nav;
+  const t = document.querySelector('.tabbar'); if (t) t.innerHTML = tabs;
 }
 function demoBanner() {
   const g = state.me.gmail;
@@ -92,6 +116,7 @@ async function viewLogin() {
 
 async function viewToday() {
   const d = await api('/api/today');
+  if (typeof d.reviewCount === 'number') state.reviewCount = d.reviewCount;
   const g = state.me.gmail;
   const today = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
   const attention = d.attention.length ? `<ul class="actions">${d.attention.map((a) => `
@@ -314,27 +339,124 @@ async function viewSettings(params) {
   </div>`;
 }
 
+// ---------- planner ----------
+const DAYMS = 864e5;
+function startOfWeek(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x; }
+const STAGE_SHORT = { new: 'New', negotiating: 'Negotiating', awaiting_delivery: 'Awaiting delivery', ready_to_film: 'Ready to film', editing: 'Editing', scheduled: 'Scheduled', published: 'Published' };
+function evClass(e) { return e.kind === 'task' ? 'task' : e.kind === 'next' ? 'next' : e.proposed ? 'proposed' : 'email'; }
+function evTitle(e) {
+  const when = fmtDate(e.date, { weekday: 'short', day: 'numeric', month: 'short' });
+  const src = e.kind === 'task' ? 'your task' : e.kind === 'next' ? 'suggested by Brieflane' : e.proposed ? 'proposed in email, not agreed' : 'stated in email';
+  return `${e.label} — ${when} (${src})`;
+}
+async function viewPlanner() {
+  const d = await api('/api/planner');
+  const weeks = 6;
+  const start = new Date(startOfWeek(new Date()).getTime() + (state.plannerOffset || 0) * 7 * DAYMS);
+  const end = new Date(start.getTime() + weeks * 7 * DAYMS);
+  const pct = (iso) => ((new Date(iso) - start) / (end - start)) * 100;
+  const inRange = (e) => { const t = new Date(e.date); return t >= start && t < end; };
+  const todayPct = pct(new Date().toISOString());
+  const weekHeads = Array.from({ length: weeks }, (_, i) => {
+    const w = new Date(start.getTime() + i * 7 * DAYMS);
+    const isNow = Date.now() >= w.getTime() && Date.now() < w.getTime() + 7 * DAYMS;
+    return `<div class="wk ${isNow ? 'now' : ''}"><span class="mono">${isNow ? 'This week' : `w/c`}</span> ${w.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</div>`;
+  }).join('');
+  const track = (events) => {
+    const vis = events.filter(inRange);
+    const before = events.filter((e) => new Date(e.date) < start).length;
+    const after = events.filter((e) => new Date(e.date) >= end).length;
+    return `<div class="track">${Array.from({ length: weeks }, () => '<span class="wkcell"></span>').join('')}
+      ${todayPct >= 0 && todayPct <= 100 ? `<i class="todayline" style="left:${todayPct}%"></i>` : ''}
+      ${vis.map((e, i) => `<span class="ev ${evClass(e)}" style="left:${pct(e.date)}%;top:${8 + (i % 3) * 22}px" title="${esc(evTitle(e))}"><i></i><b>${esc(e.label)}</b></span>`).join('')}
+      ${!vis.length ? `<span class="nodates">${before ? `${before} earlier` : ''}${before && after ? ' · ' : ''}${after ? `${after} later` : ''}${!before && !after ? 'No dates yet' : ''}</span>` : ''}
+    </div>`;
+  };
+  const upNext = (events) => events.filter((e) => new Date(e.date) >= new Date(Date.now() - DAYMS)).slice(0, 4);
+  const row = (r) => `<div class="prow" data-go="#/deals/${r.id}">
+      <div class="pinfo">
+        <div class="row" style="gap:6px"><b class="pbrand">${esc(r.brand)}</b>${r.isDemo ? demoBadge : ''}</div>
+        <div class="small muted">${esc([r.product, r.fee ? `${r.fee} · ${r.hasAgreement ? 'agreement in email' : 'not agreed'}` : null].filter(Boolean).join(' · ') || '\u00a0')}</div>
+        <div class="row" style="gap:6px;margin-top:6px"><span class="stagechip st-${r.stage}">${STAGE_SHORT[r.stage]}</span>${r.stageBasis === 'user' ? '' : '<span class="small muted" title="Stage inferred from email">AI-inferred</span>'}</div>
+        ${r.nextAction ? `<div class="pnext">→ ${esc(r.nextAction)}</div>` : ''}
+      </div>
+      <div class="ptrack">${track(r.events)}</div>
+      <ul class="pmobile">${upNext(r.events).map((e) => `<li><span class="datebox sm"><span class="m">${fmtDate(e.date, { month: 'short' })}</span><span class="dd">${new Date(e.date).getDate()}</span></span><span class="evdot ${evClass(e)}"></span><span>${esc(e.label)}<span class="small muted"> · ${e.kind === 'task' ? 'your task' : e.kind === 'next' ? 'suggested' : e.proposed ? 'proposed' : 'from email'}</span></span></li>`).join('') || '<li class="small muted">No upcoming dates</li>'}</ul>
+    </div>`;
+  const projects = d.rows.filter((r) => state.plannerShowDone || r.stage !== 'published');
+  const options = d.rows.filter((r) => r.stage !== 'published').map((r) => `<option value="${r.id}">${esc(r.brand)}${r.product ? ` — ${esc(r.product)}` : ''}</option>`).join('');
+  const loose = d.looseTasks.length ? `<div class="prow loose"><div class="pinfo"><b class="pbrand">Other tasks</b><div class="small muted">Not linked to a project</div></div>
+      <div class="ptrack">${track(d.looseTasks.filter((t) => t.due_at).map((t) => ({ date: t.due_at, label: t.title, kind: 'task' })))}</div>
+      <ul class="pmobile">${d.looseTasks.slice(0, 4).map((t) => `<li><span class="evdot task"></span>${esc(t.title)}${t.due_at ? ` <span class="small muted">· ${fmtDate(t.due_at)}</span>` : ''}</li>`).join('')}</ul></div>` : '';
+  const range = `${start.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })} – ${new Date(end - DAYMS).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}`;
+  return `${demoBanner()}
+    <div class="page-head"><div><div class="eyebrow">${weeks} weeks · ${esc(range)}</div><h1>Planner</h1></div>
+      <div class="row"><button class="btn btn-sm" data-act="plan-shift" data-v="-1" aria-label="Previous weeks">‹</button><button class="btn btn-sm" data-act="plan-shift" data-v="0">This week</button><button class="btn btn-sm" data-act="plan-shift" data-v="1" aria-label="Next weeks">›</button></div></div>
+    <div class="legend small"><span><span class="evdot email"></span>Date stated in email</span><span><span class="evdot proposed"></span>Proposed, not agreed</span><span><span class="evdot task"></span>Your task</span><span><span class="evdot next"></span>Suggested next step</span></div>
+    ${projects.length || loose ? `<section class="card planner">
+      <div class="phead"><div class="pinfo muted small">Project</div><div class="ptrack"><div class="weeks">${weekHeads}</div></div></div>
+      ${projects.map(row).join('')}${loose}
+    </section>` : '<div class="card empty">No projects yet. Connect Gmail in Settings and check email; each brand deal becomes a row here.</div>'}
+    <section class="card card-pad" style="margin-top:16px">
+      <h2 style="margin-bottom:10px">Add to the plan</h2>
+      <form data-form="plan-task" class="planform">
+        <select name="collabId" aria-label="Project"><option value="">No project</option>${options}</select>
+        <input type="text" name="title" placeholder="e.g. Film B-roll, send draft, post Short" required aria-label="Task">
+        <input type="date" name="dueAt" required aria-label="Date">
+        <button class="btn btn-primary" type="submit">${icon('plus')}Add</button>
+      </form>
+      <label class="row small muted" style="margin-top:10px;gap:6px"><input type="checkbox" data-act="plan-done" ${state.plannerShowDone ? 'checked' : ''}> Show published projects</label>
+    </section>`;
+}
+
 // ---------- router ----------
+let renderSeq = 0;
+const LOADING = '<div class="card empty loading-card"><span class="spin"></span> Loading…</div>';
 async function render() {
+  const seq = ++renderSeq;            // newer navigations win; stale responses are dropped
   const [pathPart, qs] = (location.hash.slice(1) || '/today').split('?');
   const params = new URLSearchParams(qs || '');
   const parts = pathPart.split('/').filter(Boolean);
   if (!state.me) {
-    try { state.me = await api('/api/me'); } catch { return viewLogin(); }
+    try { state.me = await api('/api/me'); } catch (e) { if (seq === renderSeq) { if (e.status === 401 || e.status === 403) return viewLogin(); return showFatal(e); } return; }
+    if (seq !== renderSeq) return;
+    refreshBadge();
   }
   const route = parts[0] || 'today';
-  const views = { today: viewToday, deals: () => (parts[1] ? viewDeal(parts[1]) : viewDeals(params)), calendar: viewCalendar, review: viewReview, assistant: viewAssistant, settings: () => viewSettings(params) };
+  const views = { today: viewToday, planner: viewPlanner, deals: () => (parts[1] ? viewDeal(parts[1]) : viewDeals(params)), calendar: viewCalendar, review: viewReview, assistant: viewAssistant, settings: () => viewSettings(params) };
   const view = views[route] || viewToday;
-  if (!document.querySelector('.shell')) $app.innerHTML = shell(route, '<div class="empty"><span class="spin"></span></div>');
+
+  // Instant feedback: highlight the tapped menu item and show progress straight away.
+  const main = document.getElementById('main');
+  if (!main) $app.innerHTML = shell(route, LOADING);
+  else {
+    updateNav(route);
+    document.body.classList.add('busy');
+    if (main.dataset.route !== pathPart) main.innerHTML = LOADING;
+  }
   try {
-    const [html, rv] = await Promise.all([view(), api('/api/review').catch(() => null)]);
-    if (rv) state.reviewCount = rv.collabs.length + rv.facts.length;
+    const html = await view();
+    if (seq !== renderSeq) return;
     $app.innerHTML = shell(route, html);
+    document.getElementById('main').dataset.route = pathPart;
     if (route === 'assistant') { const ch = document.getElementById('chat'); ch.scrollTop = ch.scrollHeight; }
   } catch (e) {
+    if (seq !== renderSeq) return;
     if (e.status === 401) { state.me = null; return viewLogin(); }
-    $app.innerHTML = shell(route, `<div class="card empty">${esc(e.message)}</div>`);
+    $app.innerHTML = shell(route, `<div class="card card-pad stack" role="alert"><h2>That didn't load</h2><p class="muted" style="margin:0">${esc(e.message)}</p><div><button class="btn btn-primary" data-act="retry">Try again</button></div></div>`);
+  } finally {
+    if (seq === renderSeq) document.body.classList.remove('busy');
   }
+}
+function showFatal(e) {
+  $app.innerHTML = `<div class="login"><div class="card login-card stack"><h1>Brieflane</h1><p class="muted">${esc(e.message)}</p><button class="btn btn-primary" data-act="retry">Try again</button></div></div>`;
+}
+/** Review badge loads in the background so it never slows navigation. */
+async function refreshBadge() {
+  try {
+    const b = await api('/api/badge', { timeoutMs: 15000 });
+    if (b.review !== state.reviewCount) { state.reviewCount = b.review; updateNav((location.hash.slice(2).split(/[/?]/)[0]) || 'today'); }
+  } catch { /* badge is optional */ }
 }
 window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
 
@@ -349,6 +471,9 @@ const draftEl = (el) => el.closest('[data-draft]');
 const draftFields = (box) => ({ to_addr: box.querySelector('[name=to_addr]').value, subject: box.querySelector('[name=subject]').value, body: box.querySelector('[name=body]').value });
 
 const actions = {
+  retry: () => render(),
+  'plan-shift': (el) => { const v = Number(el.dataset.v); state.plannerOffset = v === 0 ? 0 : (state.plannerOffset || 0) + v; render(); },
+  'plan-done': (el) => { state.plannerShowDone = el.checked; render(); },
   'dev-login': (el) => busy(el, async () => { await api('/auth/dev-login', { method: 'POST' }); state.me = await api('/api/me'); location.hash = state.me.gmail ? '#/today' : '#/settings'; render(); }),
   logout: async () => { await api('/auth/logout', { method: 'POST' }); state.me = null; location.hash = '#/'; render(); },
   'connect-demo': (el) => busy(el, async () => {
@@ -360,12 +485,12 @@ const actions = {
   sync: (el) => busy(el, async () => {
     const r = await runSteps('/api/gmail/sync', (t) => t.remaining && toast(`Checking email… ${t.remaining} left`));
     toast(r.collabMessages ? `${r.collabMessages} new collaboration email${r.collabMessages > 1 ? 's' : ''} · ${r.collabsCreated} new deal${r.collabsCreated === 1 ? '' : 's'}` : 'No new collaboration emails');
-    state.me = await api('/api/me'); render();
+    state.me = await api('/api/me'); refreshBadge(); render();
   }),
   'import-history': (el) => busy(el, async () => {
     const r = await runSteps('/api/gmail/import-history', (t) => toast(`Importing… ${t.processed} checked, ${t.remaining} to go`));
     toast(`Imported ${r.collabMessages} collaboration emails · ${r.toReview} detail${r.toReview === 1 ? '' : 's'} sent to Review`);
-    location.hash = '#/review'; render();
+    refreshBadge(); location.hash = '#/review'; render();
   }),
   'enable-send': async (el) => {
     if (!confirm('Grant Brieflane permission to send emails you approve?\n\nThis is separate from read access. Every email still needs your explicit approval and a final confirmation.')) return;
@@ -400,8 +525,8 @@ const actions = {
   },
   'draft-discard': (el) => busy(el, async () => { await api(`/api/drafts/${draftEl(el).dataset.draft}/discard`, { method: 'POST' }); render(); }),
   'task-toggle': (el) => busy(null, async () => { await api(`/api/tasks/${el.dataset.id}`, { method: 'PATCH', body: { done: el.checked } }); render(); }),
-  'review-collab': (el) => busy(el, async () => { await api(`/api/review/collab/${el.closest('[data-review]').dataset.review}`, { method: 'POST', body: { action: el.dataset.v } }); toast(el.dataset.v === 'confirm' ? 'Added to your tracker' : 'Dismissed'); render(); }),
-  'review-fact': (el) => busy(el, async () => { await api(`/api/review/fact/${el.closest('[data-fact]').dataset.fact}`, { method: 'POST', body: { action: el.dataset.v } }); render(); }),
+  'review-collab': (el) => busy(el, async () => { await api(`/api/review/collab/${el.closest('[data-review]').dataset.review}`, { method: 'POST', body: { action: el.dataset.v } }); toast(el.dataset.v === 'confirm' ? 'Added to your tracker' : 'Dismissed'); refreshBadge(); render(); }),
+  'review-fact': (el) => busy(el, async () => { await api(`/api/review/fact/${el.closest('[data-fact]').dataset.fact}`, { method: 'POST', body: { action: el.dataset.v } }); refreshBadge(); render(); }),
   'ask-suggest': (el) => askQuestion(el.textContent),
 };
 /** Sync/import run in short server steps (serverless time limits); keep calling until done. */
@@ -423,6 +548,10 @@ async function askQuestion(q) {
 }
 const forms = {
   ask: (f) => { const q = f.q.value.trim(); if (q) askQuestion(q); },
+  'plan-task': (f) => busy(f.querySelector('button'), async () => {
+    await api('/api/tasks', { method: 'POST', body: { title: f.title.value, dueAt: f.dueAt.value || null, collabId: f.collabId.value || null } });
+    toast('Added to your plan'); render();
+  }),
   'add-task': (f) => busy(null, async () => { await api('/api/tasks', { method: 'POST', body: { title: f.title.value, dueAt: f.dueAt.value || null, collabId: dealId() } }); render(); }),
   'add-fact': (f) => busy(null, async () => { await api(`/api/collaborations/${dealId()}/facts`, { method: 'POST', body: { kind: f.kind.value, label: f.kind.options[f.kind.selectedIndex].text, value: f.value.value, dueAt: f.dueAt.value || null } }); toast('Added — marked as set by you'); render(); }),
   retention: (f) => busy(null, async () => { await api('/api/privacy/retention', { method: 'POST', body: { days: Number(f.days.value) } }); toast('Retention saved'); }),

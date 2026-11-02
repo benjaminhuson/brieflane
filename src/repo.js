@@ -58,8 +58,8 @@ function forTenant(db, tenantId) {
       }
       return found;
     },
-    async insertMessage(m) {
-      const mid = id('msg');
+    insertMessage(m) { return repo.insertMessageWithId(id('msg'), m); },
+    async insertMessageWithId(mid, m) {
       await run(`INSERT INTO messages (tenant_id, id, gmail_id, thread_id, is_collab, collab_id, from_addr, from_name, to_addr, subject,
            sent_at, snippet, body, direction, classify_reason, message_id_header, imported_via, is_demo, created_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (tenant_id, gmail_id) DO NOTHING`,
@@ -119,6 +119,26 @@ function forTenant(db, tenantId) {
       f.evidenceAt, f.confidence, f.status || 'active', f.supersededBy, now());
       return fid;
     },
+    /** Insert many facts in one statement. Returns the ids (also set on each input object). */
+    async addFacts(list) {
+      if (!list.length) return [];
+      const cols = ['tenant_id', 'id', 'collab_id', 'kind', 'label', 'value', 'value_key', 'slot', 'due_at', 'basis', 'evidence_msg', 'evidence_quote', 'evidence_at', 'confidence', 'status', 'superseded_by', 'created_at'];
+      const base = Date.now(); const params = []; const rows = [];
+      list.forEach((f, i) => {
+        f.id = f.id || id('fct');
+        params.push(T, f.id, f.collabId, f.kind, f.label, f.value, f.valueKey, f.slot, f.dueAt, f.basis, f.evidenceMsg, f.evidenceQuote,
+          f.evidenceAt, f.confidence, f.status || 'active', f.supersededBy, new Date(base + i).toISOString()); // +i ms keeps insertion order stable
+        rows.push(`(${cols.map(() => '?').join(',')})`);
+      });
+      await db.run(`INSERT INTO facts (${cols.join(',')}) VALUES ${rows.join(',')}`, params);
+      return list.map((f) => f.id);
+    },
+    /** Mark many facts superseded by their replacements in one statement. pairs: [{ id, by }] */
+    async supersedeFacts(pairs) {
+      if (!pairs.length) return;
+      await db.run(`UPDATE facts SET status='superseded', superseded_by=v.by FROM (VALUES ${pairs.map(() => '(?::text, ?::text)').join(',')}) AS v(id, by)
+        WHERE facts.tenant_id=? AND facts.id=v.id`, [...pairs.flatMap((p) => [p.id, p.by]), T]);
+    },
     setFactStatus(fid, status, supersededBy) {
       if (!['active', 'pending_review', 'superseded', 'rejected'].includes(status)) throw new Error('bad status');
       return db.run('UPDATE facts SET status=?, superseded_by=? WHERE tenant_id=? AND id=?', [status, supersededBy, T, fid]);
@@ -151,6 +171,43 @@ function forTenant(db, tenantId) {
       if (!keys.length) return;
       await db.run(`UPDATE drafts SET ${keys.map((k) => `${k}=?`).join(', ')}, updated_at=? WHERE tenant_id=? AND id=?`,
         [...keys.map((k) => patch[k]), now(), T, did]);
+    },
+
+    /**
+     * Everything the dashboard, planner, calendar and assistant need, in ONE parallel batch.
+     * Postgres.js pipelines these over the connection, so the cost is ~1 round trip, not 6.
+     */
+    async snapshot() {
+      const [collabs, facts, drafts, tasks, counts] = await Promise.all([
+        repo.collabs(),
+        all(`SELECT f.* FROM facts f JOIN collaborations c ON c.id=f.collab_id AND c.tenant_id=f.tenant_id
+             WHERE f.tenant_id=? AND f.status='active' AND c.needs_review=0 AND c.archived=0 ORDER BY f.created_at ASC, f.id ASC`),
+        repo.pendingDrafts(),
+        repo.tasks(),
+        repo.reviewCounts(),
+      ]);
+      return { collabs, facts, drafts, tasks, reviewCount: counts.total, reviewCounts: counts };
+    },
+    async reviewCounts() {
+      const r = await one(`SELECT
+          (SELECT COUNT(*) FROM collaborations WHERE tenant_id=?1 AND needs_review=1 AND archived=0)::int AS collabs,
+          (SELECT COUNT(*) FROM facts f JOIN collaborations c ON c.id=f.collab_id
+             WHERE f.tenant_id=?1 AND f.status='pending_review' AND c.needs_review=0 AND c.archived=0)::int AS facts`.replace(/\?1/g, '$1'));
+      return { collabs: r.collabs, facts: r.facts, total: r.collabs + r.facts };
+    },
+    /** Review queue with facts and message summaries in 3 queries total. */
+    async reviewQueue() {
+      const [collabs, facts, msgs, pending] = await Promise.all([
+        repo.reviewCollabs(),
+        all(`SELECT f.* FROM facts f JOIN collaborations c ON c.id=f.collab_id WHERE f.tenant_id=? AND c.needs_review=1 AND c.archived=0
+             AND f.status IN ('active','pending_review') ORDER BY f.created_at ASC`),
+        all(`SELECT m.id, m.collab_id, m.subject, m.from_name, m.from_addr, m.sent_at, m.snippet, m.direction FROM messages m
+             JOIN collaborations c ON c.id=m.collab_id WHERE m.tenant_id=? AND c.needs_review=1 AND c.archived=0 ORDER BY m.sent_at ASC`),
+        repo.pendingFacts(),
+      ]);
+      const fBy = {}; for (const f of facts) (fBy[f.collab_id] ||= []).push(f);
+      const mBy = {}; for (const m of msgs) (mBy[m.collab_id] ||= []).push(m);
+      return { collabs: collabs.map((c) => ({ ...c, facts: fBy[c.id] || [], messages: mBy[c.id] || [] })), facts: pending };
     },
 
     // ---------- Audit ----------

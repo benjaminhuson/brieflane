@@ -32,11 +32,11 @@ async function ingestMessages({ db, repo, llm, now = new Date() }, messages, { v
 
 async function ingestOne({ repo, llm, now }, msg, via, stats) {
   stats.seen++;
-  if (await repo.hasMessage(msg.gmailId)) { stats.skippedDuplicate++; return; }
+  const [known, linked] = await Promise.all([repo.hasMessage(msg.gmailId), repo.collabByThread(msg.threadId)]);
+  if (known) { stats.skippedDuplicate++; return; }
 
-  const linked = await repo.collabByThread(msg.threadId);
   const cls = classify(msg, { threadKnown: Boolean(linked) });
-  const skip = () => repo.insertMessage({ gmailId: msg.gmailId, threadId: msg.threadId, isCollab: false, importedVia: via, isDemo: msg.isDemo });
+  const skip = (r = repo) => r.insertMessage({ gmailId: msg.gmailId, threadId: msg.threadId, isCollab: false, importedVia: via, isDemo: msg.isDemo });
   if (!cls.isCollab) { await skip(); stats.ignored++; return; }
 
   const ex = await llmExtract(llm, msg, extract(msg)); // async LLM work happens outside the transaction
@@ -46,61 +46,82 @@ async function ingestOne({ repo, llm, now }, msg, via, stats) {
     const r = repo.withDb(t);
     let collab = linked;
     if (!collab && msg.direction === 'in') collab = await r.openCollabByBrand(brandKey(ex.brand));
-    if (!collab && msg.direction === 'out') { await r.insertMessage({ gmailId: msg.gmailId, threadId: msg.threadId, isCollab: false, importedVia: via, isDemo: msg.isDemo }); stats.ignored++; return; }
+    if (!collab && msg.direction === 'out') { await skip(r); stats.ignored++; return; } // outbound mail outside tracked threads: id only
 
     let cid;
     if (!collab) {
       cid = await r.createCollab({ brand: ex.brand, brandKey: brandKey(ex.brand), agency: ex.agency, product: ex.product, kind: cls.kind,
         needsReview: historical, isDemo: msg.isDemo, createdAt: msg.sentAt });
       stats.collabsCreated++;
-    } else {
-      cid = collab.id;
-      if (!collab.product && ex.product) await r.updateCollab(cid, { product: ex.product });
-    }
-    collab = await r.collab(cid);
-    await r.linkThread(msg.threadId, cid);
-    const mid = await r.insertMessage({
-      gmailId: msg.gmailId, threadId: msg.threadId, isCollab: true, collabId: cid, fromAddr: msg.fromAddr, fromName: msg.fromName,
-      toAddr: msg.toAddr, subject: msg.subject, sentAt: msg.sentAt, snippet: msg.snippet || (msg.body || '').slice(0, 160),
-      body: msg.body, direction: msg.direction, messageIdHeader: msg.messageIdHeader, classifyReason: cls.reasons.join('; '), importedVia: via, isDemo: msg.isDemo,
-    });
+    } else cid = collab.id;
+
+    const mid = require('../crypto').id('msg');
+    const [current, fresh] = await Promise.all([
+      r.facts(cid),
+      collab ? Promise.resolve(collab) : r.collab(cid),
+      r.linkThread(msg.threadId, cid),
+      r.insertMessageWithId(mid, {
+        gmailId: msg.gmailId, threadId: msg.threadId, isCollab: true, collabId: cid, fromAddr: msg.fromAddr, fromName: msg.fromName,
+        toAddr: msg.toAddr, subject: msg.subject, sentAt: msg.sentAt, snippet: msg.snippet || (msg.body || '').slice(0, 160),
+        body: msg.body, direction: msg.direction, messageIdHeader: msg.messageIdHeader, classifyReason: cls.reasons.join('; '), importedVia: via, isDemo: msg.isDemo,
+      }),
+    ]);
+    collab = fresh;
     stats.collabMessages++; stats.collabsUpdated.add(cid);
 
     const review = historical || Boolean(collab.needs_review);
-    if (ex.brandBasis === 'email' && ex.brandQuote) {
-      await addOrUpdateFact(r, stats, cid, mid, msg.sentAt, { kind: 'brand', label: 'Brand', value: ex.brand, slot: 'brand', basis: 'email', quote: ex.brandQuote, confidence: 0.8, valueKey: `brand:${brandKey(ex.brand)}` }, review);
-    }
-    for (const f of ex.facts) await addOrUpdateFact(r, stats, cid, mid, msg.sentAt, f, review && f.kind !== 'contact');
+    const candidates = [];
+    if (ex.brandBasis === 'email' && ex.brandQuote) candidates.push([{ kind: 'brand', label: 'Brand', value: ex.brand, slot: 'brand', basis: 'email', quote: ex.brandQuote, confidence: 0.8, valueKey: `brand:${brandKey(ex.brand)}` }, review]);
+    for (const f of ex.facts) candidates.push([f, review && f.kind !== 'contact']);
+    const { inserts, supersede } = planFacts(current, candidates, { cid, mid, sentAt: msg.sentAt, stats });
+    await r.addFacts(inserts);
+    await r.supersedeFacts(supersede);
 
     const patch = {};
+    if (!collab.product && ex.product) patch.product = ex.product;
     if (msg.direction === 'in' && (!collab.last_inbound_at || msg.sentAt > collab.last_inbound_at)) patch.last_inbound_at = msg.sentAt;
     if (msg.direction === 'out' && (!collab.last_outbound_at || msg.sentAt > collab.last_outbound_at)) patch.last_outbound_at = msg.sentAt;
-    if (Object.keys(patch).length) await r.updateCollab(cid, patch);
-    await refreshDerived(r, cid, { now });
+    await refreshDerived(r, cid, { now, collab: { ...collab, ...patch }, extra: patch });
   });
 }
 
-async function addOrUpdateFact(repo, stats, cid, mid, sentAt, f, toReview) {
-  if (await repo.findFact(cid, f.valueKey)) return; // already known
-  const baseStatus = toReview ? 'pending_review' : 'active';
-  const prior = f.slot ? await repo.factsInSlot(cid, f.slot) : [];
-  const newer = prior.find((p) => p.evidence_at && p.evidence_at > sentAt);
-  // An older email arriving late is recorded as history, not as the current value.
-  const newId = await repo.addFact({ collabId: cid, kind: f.kind, label: f.label, value: f.value, valueKey: f.valueKey, slot: f.slot,
-    dueAt: f.dueAt, basis: f.basis, evidenceMsg: mid, evidenceQuote: f.quote, evidenceAt: sentAt, confidence: f.confidence,
-    status: newer ? 'superseded' : baseStatus, supersededBy: newer ? newer.id : null });
-  stats.factsAdded++;
-  if (newer) { stats.superseded++; return; }
-  if (toReview) stats.toReview++;
-  for (const p of prior) { await repo.setFactStatus(p.id, 'superseded', newId); stats.superseded++; }
+/**
+ * Decide, in memory, which extracted facts are new and which existing ones they replace.
+ * Rules: dedupe on value_key; within a slot the NEWEST email's value is current and older
+ * values are superseded, regardless of the order messages arrive in.
+ */
+function planFacts(current, candidates, { cid, mid, sentAt, stats }) {
+  const { id } = require('../crypto');
+  const live = current.map((x) => ({ ...x }));       // active + pending_review facts, mutable working copy
+  const inserts = []; const supersede = [];
+  for (const [f, toReview] of candidates) {
+    if (live.some((x) => x.value_key === f.valueKey)) continue;
+    const prior = f.slot ? live.filter((x) => x.slot === f.slot) : [];
+    const newer = prior.find((p) => p.evidence_at && p.evidence_at > sentAt);
+    const row = { id: id('fct'), collabId: cid, kind: f.kind, label: f.label, value: f.value, valueKey: f.valueKey, slot: f.slot,
+      dueAt: f.dueAt, basis: f.basis, evidenceMsg: mid, evidenceQuote: f.quote, evidenceAt: sentAt, confidence: f.confidence };
+    stats.factsAdded++;
+    if (newer) { inserts.push({ ...row, status: 'superseded', supersededBy: newer.id }); stats.superseded++; continue; }
+    row.status = toReview ? 'pending_review' : 'active';
+    inserts.push(row);
+    if (toReview) stats.toReview++;
+    for (const p of prior) {
+      const pending = inserts.find((x) => x.id === p.id);
+      if (pending) Object.assign(pending, { status: 'superseded', supersededBy: row.id });
+      else supersede.push({ id: p.id, by: row.id });
+      stats.superseded++;
+      live.splice(live.indexOf(p), 1);
+    }
+    live.push({ id: row.id, value_key: f.valueKey, slot: f.slot, evidence_at: sentAt, status: row.status });
+  }
+  return { inserts, supersede };
 }
 
 /** Recompute inferred stage and the suggested next action for one collaboration. */
-async function refreshDerived(repo, cid, { now = new Date() } = {}) {
-  const c = await repo.collab(cid);
-  const messages = await repo.messagesForCollab(cid);
-  const facts = await repo.facts(cid, { statuses: ['active'] });
-  const patch = {};
+async function refreshDerived(repo, cid, { now = new Date(), collab = null, extra = {} } = {}) {
+  const [c0, messages, facts] = await Promise.all([collab ? Promise.resolve(collab) : repo.collab(cid), repo.messagesForCollab(cid), repo.facts(cid, { statuses: ['active'] })]);
+  const c = { ...c0, ...extra };
+  const patch = { ...extra };
   if (c.stage_basis === 'inferred') {
     const s = inferStage({ messages, facts });
     const cur = AUTO_STAGES.indexOf(c.stage);

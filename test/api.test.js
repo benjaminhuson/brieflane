@@ -216,3 +216,25 @@ test('works with Netlify-style budgeted steps: tiny budget still completes acros
   assert.equal(done.data.more, false);
   assert.equal((await c.req('GET', '/api/collaborations')).data.length, 4);
 });
+
+test('planner: one row per project with dated milestones, proposals marked, tasks included', async (t) => {
+  const s = await startApp(); t.after(s.close);
+  const c = s.client(); await c.login();
+  await c.req('POST', '/api/gmail/connect-demo'); await c.steps('/api/gmail/sync');
+  const deals = (await c.req('GET', '/api/collaborations')).data;
+  const kestrel = deals.find((d) => d.brand === 'Kestrel Tools');
+  await c.req('POST', '/api/tasks', { title: 'Film unboxing', dueAt: new Date(Date.now() + 3 * 864e5).toISOString(), collabId: kestrel.id });
+  await c.req('POST', '/api/tasks', { title: 'Order filament', dueAt: new Date(Date.now() + 864e5).toISOString() });
+  const p = (await c.req('GET', '/api/planner')).data;
+  assert.equal(p.rows.length, 4, 'one row per tracked project');
+  const lumora = p.rows.find((r) => r.brand === 'Lumora Smart Home');
+  const draftDue = lumora.events.find((e) => e.label === 'Draft due');
+  assert.equal(draftDue.proposed, true, 'dates in an unagreed negotiation are marked proposed');
+  const volt = p.rows.find((r) => r.brand === 'VoltNest');
+  assert.equal(volt.events.find((e) => e.label === 'Go-live date').proposed, false);
+  assert.ok(p.rows.find((r) => r.id === kestrel.id).events.some((e) => e.kind === 'task' && e.label === 'Film unboxing'));
+  assert.deepEqual(p.looseTasks.map((x) => x.title), ['Order filament']);
+  // Rows are ordered by their next upcoming date.
+  const keys = p.rows.map((r) => r.sortKey);
+  assert.deepEqual(keys, [...keys].sort());
+});

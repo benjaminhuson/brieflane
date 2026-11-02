@@ -33,6 +33,7 @@ Without Google credentials the app runs against a clearly labelled **demo inbox*
 | Area | Detail |
 |---|---|
 | Dashboard | Daily briefing (rules; AI-written when a key is set), urgent actions with severity + reason + evidence basis, 5-week agenda, pipeline counts |
+| Planner | One row per project across a 6-week grid: dates from email, proposed (dashed) dates, your tasks and suggested next steps; add tasks to the plan; card list on mobile |
 | Tracker | 7 stages (new → negotiating → awaiting delivery → ready to film → editing → scheduled → published); kanban on desktop, filtered list on mobile |
 | Deal detail | Facts grouped by money / deliverables / dates / shipping / product / contacts, each badged **From email** (with verbatim quote), **AI-inferred**, or **Set by you**; agreement panel (needs agreement wording from *both* sides to say so); superseded-value history; linked email thread; tasks; add-your-own facts |
 | Extraction | Classifier (explainable weighted signals), brand/agency/product/contact/deliverable/deadline/fee/shipping/agreement extraction, UK date parsing, quote verification, stage inference that only moves forward and never overrides a stage you set |

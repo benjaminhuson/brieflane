@@ -2,7 +2,7 @@
 const { forTenant, STAGES, STAGE_LABEL } = require('./repo');
 const { makeServices, httpErr } = require('./services');
 const { makeLlm } = require('./ai/llm');
-const { computeAttention, pipelineCounts, upcoming, briefing } = require('./ai/attention');
+const { computeAttention, pipelineCounts, upcoming, planner, briefing, groupBy } = require('./ai/attention');
 const { ask } = require('./ai/assistant');
 const { generateDraft } = require('./ai/drafts');
 const { setStageByUser, refreshDerived } = require('./ingest/pipeline');
@@ -85,34 +85,48 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
 
   route('GET', '/api/today', {}, async (ctx) => {
     const now = clock();
+    const snap = await ctx.repo.snapshot();
+    const attention = computeAttention(snap, now);
     return {
-      briefing: await briefing(ctx.repo, llm, { now, name: (ctx.session.name || 'there').split(' ')[0] }),
-      attention: await computeAttention(ctx.repo, now),
-      pipeline: await pipelineCounts(ctx.repo),
-      upcoming: (await upcoming(ctx.repo, now, 35)).filter((u) => new Date(u.date) >= new Date(now - 864e5)),
-      hasDemoData: (await ctx.repo.collabs()).some((c) => c.is_demo),
+      briefing: await briefing(snap, llm, { now, name: (ctx.session.name || 'there').split(' ')[0], items: attention }),
+      attention,
+      pipeline: pipelineCounts(snap),
+      upcoming: upcoming(snap, now, 35).filter((u) => new Date(u.date) >= new Date(now - 864e5)),
+      hasDemoData: snap.collabs.some((c) => c.is_demo),
+      reviewCount: snap.reviewCount,
     };
   });
 
-  route('GET', '/api/collaborations', {}, async (ctx) => Promise.all((await ctx.repo.collabs()).map(async (c) => {
-    const facts = await ctx.repo.facts(c.id, { statuses: ['active'] });
-    return {
-      ...c,
-      deadline: facts.filter((f) => f.kind === 'deadline' && f.due_at).sort((a, b) => a.due_at.localeCompare(b.due_at))[0] || null,
-      fee: facts.filter((f) => f.kind === 'payment').slice(-1)[0] || null,
-      hasAgreement: facts.some((f) => f.kind === 'agreement'),
-    };
-  })));
+  route('GET', '/api/planner', {}, async (ctx) => ({ ...planner(await ctx.repo.snapshot(), clock()), today: clock().toISOString() }));
+  route('GET', '/api/badge', {}, async (ctx) => ({ review: (await ctx.repo.reviewCounts()).total }));
+
+  route('GET', '/api/collaborations', {}, async (ctx) => {
+    const snap = await ctx.repo.snapshot();
+    const factsBy = groupBy(snap.facts, 'collab_id');
+    return snap.collabs.map((c) => {
+      const facts = factsBy[c.id] || [];
+      return {
+        ...c,
+        deadline: facts.filter((f) => f.kind === 'deadline' && f.due_at).sort((a, b) => a.due_at.localeCompare(b.due_at))[0] || null,
+        fee: facts.filter((f) => f.kind === 'payment').slice(-1)[0] || null,
+        hasAgreement: facts.some((f) => f.kind === 'agreement'),
+      };
+    });
+  });
 
   route('GET', '/api/collaborations/:id', {}, async (ctx) => {
-    const c = await ctx.repo.collab(ctx.params.id);
+    const [c, facts, messages, drafts, tasks] = await Promise.all([
+      ctx.repo.collab(ctx.params.id),
+      ctx.repo.facts(ctx.params.id, { statuses: ['active', 'pending_review', 'superseded'] }),
+      ctx.repo.messagesForCollab(ctx.params.id),
+      ctx.repo.drafts(ctx.params.id),
+      ctx.repo.tasks({ includeDone: true }),
+    ]);
     if (!c) throw httpErr(404, 'not found');
     return {
-      collab: c,
-      facts: await ctx.repo.facts(c.id, { statuses: ['active', 'pending_review', 'superseded'] }),
-      messages: (await ctx.repo.messagesForCollab(c.id)).map((m) => ({ ...m, message_id_header: undefined })),
-      drafts: await ctx.repo.drafts(c.id),
-      tasks: (await ctx.repo.tasks({ includeDone: true })).filter((t) => t.collab_id === c.id),
+      collab: c, facts, drafts,
+      messages: messages.map((m) => ({ ...m, message_id_header: undefined })),
+      tasks: tasks.filter((t) => t.collab_id === c.id),
     };
   });
   route('PATCH', '/api/collaborations/:id', {}, async (ctx) => {
@@ -168,21 +182,15 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
     if (!(await ctx.repo.task(ctx.params.id))) throw httpErr(404, 'not found');
     await ctx.repo.setTaskDone(ctx.params.id, Boolean(ctx.body && ctx.body.done)); return ctx.repo.task(ctx.params.id);
   });
-  route('GET', '/api/calendar', {}, (ctx) => upcoming(ctx.repo, clock(), 120));
+  route('GET', '/api/calendar', {}, async (ctx) => upcoming(await ctx.repo.snapshot(), clock(), 120));
 
   // Review
-  route('GET', '/api/review', {}, async (ctx) => ({
-    collabs: await Promise.all((await ctx.repo.reviewCollabs()).map(async (c) => ({
-      ...c, facts: await ctx.repo.facts(c.id),
-      messages: (await ctx.repo.messagesForCollab(c.id)).map(({ id, subject, from_name, from_addr, sent_at, snippet, direction }) => ({ id, subject, from_name, from_addr, sent_at, snippet, direction })),
-    }))),
-    facts: await ctx.repo.pendingFacts(),
-  }));
+  route('GET', '/api/review', {}, (ctx) => ctx.repo.reviewQueue());
   route('POST', '/api/review/collab/:id', {}, async (ctx) => { await svc.reviewCollab(ctx.repo, ctx.params.id, ctx.body && ctx.body.action, ctx.session.user_id); return { ok: true }; });
   route('POST', '/api/review/fact/:id', {}, async (ctx) => { await svc.reviewFact(ctx.repo, ctx.params.id, ctx.body && ctx.body.action, ctx.session.user_id); return { ok: true }; });
 
   // Assistant
-  route('POST', '/api/assistant', {}, (ctx) => { limit(`ai:${ctx.session.tenant_id}`, 30); return ask(ctx.repo, llm, ctx.body && ctx.body.question, clock()); });
+  route('POST', '/api/assistant', {}, async (ctx) => { limit(`ai:${ctx.session.tenant_id}`, 30); return ask(await ctx.repo.snapshot(), llm, ctx.body && ctx.body.question, clock()); });
 
   // Gmail
   route('POST', '/api/gmail/connect-demo', {}, async (ctx) => { await svc.connectDemo(ctx.repo, ctx.session); return { ok: true }; });
@@ -217,7 +225,11 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
     return { ok: true };
   });
   route('GET', '/api/audit', {}, (ctx) => ctx.repo.auditLog(100));
-  route('GET', '/api/health', { public: true }, async () => { await db.query('SELECT 1 AS ok'); return { ok: true, db: db.kind }; });
+  route('GET', '/api/health', { public: true }, async () => {
+    const t0 = Date.now(); await db.query('SELECT 1 AS ok'); const first = Date.now() - t0;
+    const t1 = Date.now(); for (let i = 0; i < 3; i++) await db.query('SELECT 1 AS ok');
+    return { ok: true, db: db.kind, firstQueryMs: first, roundTripMs: Math.round((Date.now() - t1) / 3), region: process.env.AWS_REGION || 'local' };
+  });
 
   // ================= Core handler =================
   async function handleRequest({ method, url, headers = {}, body = null, ip = '' }) {
@@ -239,7 +251,9 @@ function createApp({ cfg, db, fetchImpl = globalThis.fetch, clock = () => new Da
         try { ctx.body = body ? JSON.parse(body) : {}; } catch { throw httpErr(400, 'Invalid JSON'); }
       }
       if (ctx.session) ctx.repo = forTenant(db, ctx.session.tenant_id);
+      const started = Date.now();
       const result = await r.handler(ctx);
+      out.headers['Server-Timing'] = `app;dur=${Date.now() - started}`;
       if (result && result.redirect && method === 'GET') { out.status = 302; out.headers.Location = result.redirect; return out; }
       return json(out, 200, result === undefined ? { ok: true } : result);
     } catch (e) {

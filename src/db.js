@@ -206,14 +206,15 @@ async function openDb(cfg) {
   let db;
   if (cfg.databaseUrl) {
     const postgres = require('postgres');
-    // prepare:false — required by Supabase's transaction pooler; max:1 — one connection per function instance.
-    db = wrapPostgres(postgres(cfg.databaseUrl, { prepare: false, max: cfg.isServerless ? 1 : 5, idle_timeout: 20, connect_timeout: 10, onnotice: () => {} }));
+    // prepare:false — required by Supabase's transaction pooler; a few connections so a request's parallel queries overlap.
+    db = wrapPostgres(postgres(cfg.databaseUrl, { prepare: false, max: cfg.isServerless ? 4 : 6, idle_timeout: 20, connect_timeout: 10, onnotice: () => {} }));
   } else {
     const PGLITE = '@electric-sql/pglite'; // dynamic import keeps it out of the Netlify bundle
     const { PGlite } = await import(PGLITE);
     db = wrapPglite(cfg.dbPath === ':memory:' ? new PGlite() : new PGlite(cfg.dbPath));
   }
-  await db.exec(`BEGIN; ${SCHEMA} COMMIT;`);
+  // Run inside the driver's own transaction API (postgres.js refuses raw BEGIN when pooling connections).
+  await db.tx((t) => t.exec(SCHEMA));
   return db;
 }
 
